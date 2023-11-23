@@ -94,6 +94,9 @@ class Config:
   # What that loss is imposed on, options are 'normals' or 'normals_pred'.
   orientation_loss_target: str = 'normals_pred'
   predicted_normal_loss_mult: float = 0.0  # Mult. on the predicted normal loss.
+  predicted_viewdir_loss_mult: float = 0.0  # Mult. on the predicted viewdir.
+  predicted_viewmlp_loss_mult: float = 0.0
+  
   # Mult. on the coarser predicted normal loss.
   predicted_normal_coarse_loss_mult: float = 0.0
   weight_decay_mults: FrozenDict[str, Any] = FrozenDict({})  # Weight decays.
@@ -124,7 +127,8 @@ class Config:
   eval_dataset_limit: int = jnp.iinfo(jnp.int32).max  # Num test images to eval.
   eval_quantize_metrics: bool = True  # If True, run metrics on 8-bit images.
   eval_crop_borders: int = 0  # Ignore c border pixels in eval (x[c:-c, c:-c]).
-
+  eval_average_metrics: bool = True  # If True, average metrics over images.
+  
   # Only used by render.py
   render_video_fps: int = 60  # Framerate in frames-per-second.
   render_video_crf: int = 18  # Constant rate factor for ffmpeg video quality.

@@ -209,13 +209,13 @@ def volumetric_rendering(rgbs,
 
   if compute_extras:
     rendering['acc'] = acc
-
+    weights_to_use = jnp.array(weights[:,:weights.shape[-1] // 2])
     if extras is not None:
       for k, v in extras.items():
         if v is not None:
-          rendering[k] = (weights[..., None] * v).sum(axis=-2)
+          rendering[k] = (weights_to_use[..., None] * v).sum(axis=-2)
 
-    expectation = lambda x: (weights * x).sum(axis=-1) / jnp.maximum(eps, acc)
+    expectation = lambda x: (weights_to_use * x).sum(axis=-1) / jnp.maximum(eps, acc)
     t_mids = 0.5 * (tdist[..., :-1] + tdist[..., 1:])
     # For numerical stability this expectation is computing using log-distance.
     rendering['distance_mean'] = (
@@ -227,7 +227,7 @@ def volumetric_rendering(rgbs,
     # whatever weight is needed to make the new weight vector sum to exactly 1
     # (`weights` is only guaranteed to sum to <= 1, not == 1).
     t_aug = jnp.concatenate([tdist, t_far], axis=-1)
-    weights_aug = jnp.concatenate([weights, bg_w], axis=-1)
+    weights_aug = jnp.concatenate([weights_to_use, bg_w], axis=-1)
 
     ps = [5, 50, 95]
     distance_percentiles = stepfun.weighted_percentile(t_aug, weights_aug, ps)

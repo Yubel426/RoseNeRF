@@ -125,3 +125,10 @@ def sorted_interp(x, xp, fp):
   offset = jnp.clip(jnp.nan_to_num((x - xp0) / (xp1 - xp0), 0), 0, 1)
   ret = fp0 + offset * (fp1 - fp0)
   return ret
+
+
+def l2_normalize(x, eps=1e-8):
+    """Normalize x to unit length along the last axis."""
+    norm = jnp.sqrt(jnp.maximum(jnp.sum(x**2, axis=-1, keepdims=True), eps))
+    return x / norm
+

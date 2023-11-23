@@ -191,6 +191,25 @@ def predicted_normal_loss(model, ray_history, config):
   return total_loss
 
 
+def predicted_viewdir_loss(ray_history, config):
+  first_ray_results = ray_history[0]
+  view = first_ray_results['view']
+  view_pred = first_ray_results['view_pred']
+  view_repred = first_ray_results['view_repred']
+  loss_view = jnp.mean((1.0 - jnp.sum(view * view_pred, axis=-1)).sum(axis=-1))
+  loss_view += jnp.mean((1.0 + jnp.sum(view * view_repred, axis=-1)).sum(axis=-1))
+  return config.predicted_viewdir_loss_mult * loss_view
+
+
+def predicted_viewmlp_loss(ray_history, config):
+  first_ray_results = ray_history[0]
+  view_pred = first_ray_results['view_pred']
+  view_pred_wo_normal = first_ray_results['view_pred_wo_normal']
+  loss_viewmlp = jnp.mean((1.0 - jnp.sum(view_pred * view_pred_wo_normal, axis=-1)).sum(axis=-1))    
+         
+  return config.predicted_viewmlp_loss_mult * loss_viewmlp
+  
+
 def clip_gradients(grad, config):
   """Clips gradients of each MLP individually based on norm and max value."""
   # Clip the gradients of each MLP individually.
@@ -291,6 +310,12 @@ def create_train_step(model: models.Model,
           config.predicted_normal_loss_mult > 0):
         losses['predicted_normals'] = predicted_normal_loss(
             model, ray_history, config)
+
+      if config.predicted_viewdir_loss_mult > 0:
+        losses['predicted_viewdirs'] = predicted_viewdir_loss(ray_history, config)
+      
+      if config.predicted_viewmlp_loss_mult > 0:
+        losses['predicted_viewmlp'] = predicted_viewmlp_loss(ray_history, config)
 
       stats['weight_l2s'] = summarize_tree(variables['params'], tree_norm_sq)
 

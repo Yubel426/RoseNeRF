@@ -187,6 +187,14 @@ def main(unused_argv):
 
           utils.save_img_f32(rendering['acc'], path_fn(f'acc_{idx:03d}.tiff'))
 
+    if config.eval_average_metrics:
+      print('Average metrics:')
+      with utils.open_file(path_fn(f'Average_metric_{step}.txt'), 'w') as f:
+        for name in metrics[0]:
+          scores = [m[name] for m in metrics]
+          f.write(f'{name:30s} = {np.mean(scores):.4f}')
+          print(f'{name:30s} = {np.mean(scores):.4f}')
+
     if (not config.eval_only_once) and (jax.host_id() == 0):
       summary_writer.scalar('eval_median_render_time', np.median(render_times),
                             step)

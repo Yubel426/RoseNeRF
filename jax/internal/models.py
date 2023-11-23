@@ -15,9 +15,11 @@
 """NeRF and its MLPs, with helper functions for construction and rendering."""
 
 import functools
+import copy
 from typing import Any, Callable, List, Mapping, MutableMapping, Optional, Text, Tuple
 
 from flax import linen as nn
+from flax import struct 
 import gin
 from internal import configs
 from internal import coord
@@ -28,6 +30,7 @@ from internal import ref_utils
 from internal import render
 from internal import stepfun
 from internal import utils
+from internal import snerf_utils
 import jax
 from jax import random
 import jax.numpy as jnp
@@ -43,6 +46,40 @@ def random_split(rng):
     key, rng = random.split(rng)
   return key, rng
 
+
+class ViewMLP(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        dim_out = [128, 128, 128, 4]
+        padding = 0.001
+
+        # Define the layers
+        for i in range(4):
+            x = nn.Dense(dim_out[i])(x)
+            x = nn.tanh(x)
+        
+        # TODO: add the noise here if needed
+        # Normalize the output
+        x = x / math.l2_normalize(x)
+        x = x * (1 + 2 * padding) - padding
+        return x
+
+
+class ViewminiMLP(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        dim_out = [64, 64, 4]
+
+        # Define the layers
+        for i in range(3):
+            x = nn.Dense(features=dim_out[i])(x)
+            x = nn.tanh(x)
+        
+        # TODO: add the noise here if needed
+        # Normalize the output
+        x = x / math.l2_normalize(x)
+        return x
+  
 
 @gin.configurable
 class Model(nn.Module):
@@ -71,6 +108,8 @@ class Model(nn.Module):
   use_gpu_resampling: bool = False  # Use gather ops for faster GPU resampling.
   opaque_background: bool = False  # If true, make the background opaque.
   num_space: int = 1 # The number of sub-spaces
+  use_viewmlp: bool = False # If true, use viewmlp
+  use_two_mlp: bool = False # If true, use two mlp for each level
 
   @nn.compact
   def __call__(
@@ -99,6 +138,15 @@ class Model(nn.Module):
     nerf_mlp = NerfMLP()
     prop_mlp = nerf_mlp if self.single_mlp else PropMLP()
     decoder = None if self.num_space == 1 else DecoderMLP()
+    if self.use_viewmlp:
+      view_mlp = ViewMLP()
+      mini_view_mlp = ViewminiMLP()
+    if self.use_two_mlp:
+      nerf_mlp2 = NerfMLP()
+      prop_mlp2 = nerf_mlp2 if self.single_mlp else PropMLP()
+    else:
+      nerf_mlp2 = nerf_mlp
+      prop_mlp2 = prop_mlp
 
     if self.num_glo_features > 0:
       if not zero_glo:
@@ -143,13 +191,15 @@ class Model(nn.Module):
                             axis=-1)
     weights = jnp.ones_like(rays.near)
     prod_num_samples = 1
-
+    sdist2 = jnp.copy(sdist)
+    weights2 = jnp.copy(weights)
     ray_history = []
     renderings = []
     for i_level in range(self.num_levels):
       is_prop = i_level < (self.num_levels - 1)
       num_samples = self.num_prop_samples if is_prop else self.num_nerf_samples
 
+      is_second = 1 if (i_level != 0 and self.use_viewmlp) else 0
       # Dilate by some multiple of the expected span of each current interval,
       # with some bias added in.
       dilation = self.dilation_bias + self.dilation_multiplier * (
@@ -234,13 +284,86 @@ class Model(nn.Module):
       )
 
       # Get the weights used by volumetric rendering (and our other losses).
-      cumprod_weights = render.compute_alpha_weights if is_prop or self.num_space == 1 else render.compute_alpha_weights_multispace
+      if is_prop or self.num_space == 1:
+        cumprod_weights = render.compute_alpha_weights  
+      else:
+        cumprod_weights = render.compute_alpha_weights_multispace
       weights = cumprod_weights(
           ray_results['density'],
           tdist,
           rays.directions,
           opaque_background=self.opaque_background,
       )[0]
+
+      
+      # Push our Gaussians through the second MLP if needed.
+      if is_second:
+        if i_level > 0 and use_dilation:
+          sdist2, weights2 = stepfun.max_dilate_weights(
+              sdist2,
+              weights2,
+              dilation,
+              domain=(init_s_near, init_s_far),
+              renormalize=True)
+          sdist2 = sdist[..., 1:-1]
+          weights2 = weights[..., 1:-1]
+
+        # A slightly more stable way to compute weights**anneal. If the distance
+        # between adjacent intervals is zero then its weight is fixed to 0.
+        logits_resample2 = jnp.where(
+            sdist2[..., 1:] > sdist2[..., :-1],
+            anneal * jnp.log(weights2 + self.resample_padding), -jnp.inf)
+
+        # Draw sampled intervals from each ray's current weights.
+        key, rng = random_split(rng)
+        sdist2 = stepfun.sample_intervals(
+            key,
+            sdist2,
+            logits_resample2,
+            num_samples,
+            single_jitter=self.single_jitter,
+            domain=(init_s_near, init_s_far),
+            use_gpu_resampling=self.use_gpu_resampling)
+
+        # Optimization will usually go nonlinear if you propagate gradients
+        # through sampling.
+        if self.stop_level_grad:
+          sdist2 = jax.lax.stop_gradient(sdist2)
+
+        # Convert normalized distances to metric distances.
+        tdist2 = s_to_t(sdist2)
+        # Cast our rays, by turning our distance intervals into Gaussians.
+        gaussians2 = render.cast_rays(
+          tdist2,
+          rays2.origins,
+          rays2.directions,
+          rays2.radii,
+          self.ray_shape,
+          diag=False)
+      
+        mlp2 = prop_mlp2 if is_prop else nerf_mlp2 
+        ray_results2 = mlp2(
+          key,
+          gaussians2,
+          viewdirs=rays2.viewdirs if self.use_viewdirs else None,
+          imageplane=rays2.imageplane,
+          glo_vec=None if is_prop else glo_vec,
+          exposure=rays2.exposure_values,
+          num_space=1 if is_prop else self.num_space,
+        )
+        weights2 = cumprod_weights(
+          ray_results['density'],
+          tdist2,
+          rays2.directions,
+          opaque_background=self.opaque_background,
+        )[0]
+        weights_to_use = jnp.concatenate(
+          [weights, weights2], axis=-1)
+        rgb_to_use = jnp.concatenate(
+          [ray_results['rgb'], ray_results2['rgb']], axis=-2)
+      else:
+        weights_to_use = weights
+        rgb_to_use = ray_results['rgb']
 
       # Define or sample the background color for each ray.
       if self.bg_intensity_range[0] == self.bg_intensity_range[1]:
@@ -259,7 +382,7 @@ class Model(nn.Module):
             shape=weights.shape[:-1] + (3,),
             minval=self.bg_intensity_range[0],
             maxval=self.bg_intensity_range[1])
-
+      
       # RawNeRF exposure logic.
       if rays.exposure_idx is not None:
         # Scale output colors by the exposure.
@@ -275,8 +398,8 @@ class Model(nn.Module):
 
       if self.num_space == 1 or is_prop:
         rendering = render.volumetric_rendering(
-            ray_results['rgb'],
-            weights,
+            rgb_to_use,
+            weights_to_use,
             tdist,
             bg_rgbs,
             rays.far,
@@ -287,21 +410,42 @@ class Model(nn.Module):
                 if k.startswith('normals') or k in ['roughness']
             })
       else:
-        rendering, weights, ray_rgbs = render.volumetric_rendering_multispace(ray_results['rgb'], 
-                                                                              weights, 
-                                                                              tdist, 
-                                                                              bg_rgbs, 
-                                                                              rays.far, 
-                                                                              compute_extras,
-                                                                              num_space=self.num_space,
-                                                                              decoder=decoder,
-                                                                              extras={
-                                                                              k: v
-                                                                              for k, v in ray_results.items()
-                                                                              if k.startswith('normals') or k in ['roughness']
-                                                                              })
+        rendering, weights, ray_rgbs = render.volumetric_rendering_multispace(
+            ray_results['rgb'], 
+            weights, 
+            tdist, 
+            bg_rgbs, 
+            rays.far, 
+            compute_extras,
+            num_space=self.num_space*2 if is_second else self.num_space,
+            decoder=decoder,
+            extras={
+                k: v
+                for k, v in ray_results.items()
+                if k.startswith('normals') or k in ['roughness']
+            })
         ray_results['rgb'] = ray_rgbs
       
+      if i_level == 0:
+        uvst = snerf_utils.get_rays_uvst(rays.origins, rays.directions,0,1)
+        normal = (ray_results["normals"] * weights[..., None]).sum(axis=-2)
+        uvst_normal = jnp.concatenate([uvst, normal], axis=-1)
+        uvst_pred = view_mlp(uvst_normal)
+        new_origins = snerf_utils.get_interest_point(uvst_pred, 0)
+        new_directions = snerf_utils.get_rays_d(uvst_pred, 0, 1)
+        new_viewdirs = new_directions / jnp.linalg.norm(new_directions, axis=-1, keepdims=True)
+        # rays2 = struct.replace(
+        #   rays, origins=new_origins, directions=new_directions, viewdirs=new_viewdirs)
+        rays2 = utils.Rays(**{**rays.__dict__, 'origins': new_origins, 'directions': new_directions, 'viewdirs': new_viewdirs})
+        uvst_repred = mini_view_mlp(uvst_pred)
+        uvst_pred_wo_normal = mini_view_mlp(uvst)
+        view_pred_wo_normal = snerf_utils.get_rays_d(uvst_pred_wo_normal, 0, 1)
+        ray_results['view'] = rays.origins
+        ray_results['view_pred'] = rays2.origins
+        ray_results['view_pred_wo_normal'] = view_pred_wo_normal
+        ray_results['view_repred'] = snerf_utils.get_interest_point(uvst_repred, 0)
+
+
       if compute_extras:
         # Collect some rays to visualize directly. By naming these quantities
         # with `ray_` they get treated differently downstream --- they're
@@ -317,6 +461,10 @@ class Model(nn.Module):
       ray_results['sdist'] = jnp.copy(sdist)
       ray_results['weights'] = jnp.copy(weights)
       ray_history.append(ray_results)
+      if is_second:
+        ray_results2['sdist'] = jnp.copy(sdist)
+        ray_results2['weights'] = jnp.copy(weights2)
+        ray_history.append(ray_results2)
 
     if compute_extras:
       # Because the proposal network doesn't produce meaningful colors, for
