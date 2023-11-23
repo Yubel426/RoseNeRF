@@ -209,7 +209,8 @@ def volumetric_rendering(rgbs,
 
   if compute_extras:
     rendering['acc'] = acc
-    weights_to_use = jnp.array(weights[:,:weights.shape[-1] // 2])
+    # Todo: 
+    weights_to_use = jnp.array(weights[:,:64]) # Modify here!
     if extras is not None:
       for k, v in extras.items():
         if v is not None:
