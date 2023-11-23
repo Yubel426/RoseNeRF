@@ -124,7 +124,8 @@ class Config:
   eval_dataset_limit: int = jnp.iinfo(jnp.int32).max  # Num test images to eval.
   eval_quantize_metrics: bool = True  # If True, run metrics on 8-bit images.
   eval_crop_borders: int = 0  # Ignore c border pixels in eval (x[c:-c, c:-c]).
-
+  eval_average_metrics : bool = True
+  
   # Only used by render.py
   render_video_fps: int = 60  # Framerate in frames-per-second.
   render_video_crf: int = 18  # Constant rate factor for ffmpeg video quality.
