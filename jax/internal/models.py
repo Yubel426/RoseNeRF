@@ -56,12 +56,12 @@ class ViewMLP(nn.Module):
         # Define the layers
         for i in range(4):
             x = nn.Dense(dim_out[i])(x)
-            x = nn.tanh(x)
+            # x = nn.tanh(x)
         
         # TODO: add the noise here if needed
         # Normalize the output
-        x = x / math.l2_normalize(x)
-        x = x * (1 + 2 * padding) - padding
+        # x = x / math.l2_normalize(x)
+        # x = x * (1 + 2 * padding) - padding
         return x
 
 
@@ -73,11 +73,11 @@ class ViewminiMLP(nn.Module):
         # Define the layers
         for i in range(3):
             x = nn.Dense(features=dim_out[i])(x)
-            x = nn.tanh(x)
+            # x = nn.tanh(x)
         
         # TODO: add the noise here if needed
         # Normalize the output
-        x = x / math.l2_normalize(x)
+        # x = x / math.l2_normalize(x)
         return x
   
 
@@ -119,6 +119,8 @@ class Model(nn.Module):
       train_frac,
       compute_extras,
       zero_glo=True,
+      is_second=False,
+      
   ):
     """The mip-NeRF Model.
 
@@ -195,11 +197,13 @@ class Model(nn.Module):
     weights2 = jnp.copy(weights)
     ray_history = []
     renderings = []
+
     for i_level in range(self.num_levels):
       is_prop = i_level < (self.num_levels - 1)
       num_samples = self.num_prop_samples if is_prop else self.num_nerf_samples
 
-      is_second = 1 if (i_level != 0 and self.use_viewmlp) else 0
+      is_second = True if (i_level != 0 and self.use_viewmlp and is_second) else False
+
       # Dilate by some multiple of the expected span of each current interval,
       # with some bias added in.
       dilation = self.dilation_bias + self.dilation_multiplier * (
@@ -358,9 +362,9 @@ class Model(nn.Module):
           opaque_background=self.opaque_background,
         )[0]
         weights_to_use = jnp.concatenate(
-          [weights, weights2], axis=-1)
+          [weights / 2, weights2 / 2], axis=-1)
         rgb_to_use = jnp.concatenate(
-          [ray_results['rgb'], ray_results2['rgb']], axis=-2)
+          [ray_results['rgb'] / 2, ray_results2['rgb'] / 2], axis=-2)
       else:
         weights_to_use = weights
         rgb_to_use = ray_results['rgb']
@@ -425,13 +429,13 @@ class Model(nn.Module):
                 if k.startswith('normals') or k in ['roughness']
             })
         ray_results['rgb'] = ray_rgbs
-      
+
       if i_level == 0:
         uvst = snerf_utils.get_rays_uvst(rays.origins, rays.directions,0,1)
         normal = (ray_results["normals"] * weights[..., None]).sum(axis=-2)
         uvst_normal = jnp.concatenate([uvst, normal], axis=-1)
         uvst_pred = view_mlp(uvst_normal)
-        new_origins = snerf_utils.get_interest_point(uvst_pred, 0)
+        new_origins = snerf_utils.get_interest_point(uvst_pred, rays.origins[...,-1:])
         new_directions = snerf_utils.get_rays_d(uvst_pred, 0, 1)
         new_viewdirs = new_directions / jnp.linalg.norm(new_directions, axis=-1, keepdims=True)
         # rays2 = struct.replace(
@@ -439,12 +443,13 @@ class Model(nn.Module):
         rays2 = utils.Rays(**{**rays.__dict__, 'origins': new_origins, 'directions': new_directions, 'viewdirs': new_viewdirs})
         uvst_repred = mini_view_mlp(uvst_pred)
         uvst_pred_wo_normal = mini_view_mlp(uvst)
-        view_pred_wo_normal = snerf_utils.get_rays_d(uvst_pred_wo_normal, 0, 1)
+        new_directions_wo_normal = snerf_utils.get_rays_d(uvst_pred_wo_normal, 0, 1)
         ray_results['view'] = rays.origins
-        ray_results['view_pred'] = rays2.origins
-        ray_results['view_pred_wo_normal'] = view_pred_wo_normal
-        ray_results['view_repred'] = snerf_utils.get_interest_point(uvst_repred, 0)
-
+        ray_results['view_pred'] = new_directions
+        ray_results['view_pred_wo_normal'] = new_directions_wo_normal
+        ray_results['view_repred'] = snerf_utils.get_rays_d(uvst_repred, 0, 1)
+        # ray_results['uvst_repred'] = uvst_repred
+        # ray_results['uvst'] = uvst
 
       if compute_extras:
         # Collect some rays to visualize directly. By naming these quantities

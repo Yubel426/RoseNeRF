@@ -119,13 +119,16 @@ def main(unused_argv):
 
     learning_rate = lr_fn(step)
     train_frac = jnp.clip((step - 1) / (config.max_steps - 1), 0, 1)
-
+    is_second = False
+    if step > config.warmup_steps:
+      is_second = True
     state, stats, rngs = train_pstep(
         rngs,
         state,
         batch,
         cameras,
         train_frac,
+        is_second,
     )
 
     if step % config.gc_every == 0:

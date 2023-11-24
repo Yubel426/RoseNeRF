@@ -94,9 +94,9 @@ class Config:
   # What that loss is imposed on, options are 'normals' or 'normals_pred'.
   orientation_loss_target: str = 'normals_pred'
   predicted_normal_loss_mult: float = 0.0  # Mult. on the predicted normal loss.
-  predicted_viewdir_loss_mult: float = 0.0  # Mult. on the predicted viewdir.
-  predicted_viewmlp_loss_mult: float = 0.0
-  
+  viewdir_loss_mult: float = 0.0  # Mult. on the predicted viewdir.
+  tmlp_loss_mult: float = 0.0
+  warmup_steps: int = 5000  # Number of steps to warmup the model.
   # Mult. on the coarser predicted normal loss.
   predicted_normal_coarse_loss_mult: float = 0.0
   weight_decay_mults: FrozenDict[str, Any] = FrozenDict({})  # Weight decays.

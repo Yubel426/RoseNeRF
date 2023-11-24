@@ -17,7 +17,6 @@ def get_rays_uvst(rays_o, rays_d, z1=0, z2=1):
 def get_interest_point(uvst, z_val):
     # uvst[batch_size, 4]
     # z_val[batch_size, 1]
-    z_val = jnp.full((*uvst.shape[:-1],1), z_val)
     x1, y1, x2, y2 = jnp.split(uvst, 4, axis=-1)
     # 计算交点
     # z1 = 0, z2 = 1
@@ -26,9 +25,10 @@ def get_interest_point(uvst, z_val):
     interest_point = jnp.concatenate([x0, y0, z_val], axis=-1)
     return interest_point
 
-def normalize(v):
-    """Normalize a vector."""
-    return v / jnp.linalg.norm(v, axis=-1, keepdims=True)
+def l2_normalize(x, eps=1e-8):
+    """Normalize x to unit length along the last axis."""
+    norm = jnp.sqrt(jnp.maximum(jnp.sum(x**2, axis=-1, keepdims=True), eps))
+    return x / norm
 
 def get_rays_d(uvst, z1=0, z2=1):
     # uvst[batch_size, 4]
@@ -38,5 +38,5 @@ def get_rays_d(uvst, z1=0, z2=1):
     b = y2 - y1
     c = jnp.full_like(a, z2 - z1)  # Assuming z1=0 and z2=1
     # 方向归一化
-    rays_d = normalize(jnp.concatenate([a, b, c], axis=-1))
+    rays_d = l2_normalize(jnp.concatenate([a, b, c], axis=-1))
     return rays_d

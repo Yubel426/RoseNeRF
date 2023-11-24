@@ -210,10 +210,10 @@ def volumetric_rendering(rgbs,
   if compute_extras:
     rendering['acc'] = acc
     # Todo: 
-    weights_to_use = jnp.array(weights[:,:64]) # Modify here!
     if extras is not None:
       for k, v in extras.items():
         if v is not None:
+          weights_to_use = jnp.array(weights[:,:v.shape[-2]]) # Modify here!
           rendering[k] = (weights_to_use[..., None] * v).sum(axis=-2)
 
     expectation = lambda x: (weights_to_use * x).sum(axis=-1) / jnp.maximum(eps, acc)

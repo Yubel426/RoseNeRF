@@ -191,23 +191,26 @@ def predicted_normal_loss(model, ray_history, config):
   return total_loss
 
 
-def predicted_viewdir_loss(ray_history, config):
+def viewdir_loss(ray_history, config):
   first_ray_results = ray_history[0]
   view = first_ray_results['view']
   view_pred = first_ray_results['view_pred']
   view_repred = first_ray_results['view_repred']
-  loss_view = jnp.mean((1.0 - jnp.sum(view * view_pred, axis=-1)).sum(axis=-1))
-  loss_view += jnp.mean((1.0 + jnp.sum(view * view_repred, axis=-1)).sum(axis=-1))
-  return config.predicted_viewdir_loss_mult * loss_view
+  # uvst_repred = ray_results['uvst_repred']
+  # uvst = ray_results['uvst']
+  loss_view = jnp.mean((1.0 - jnp.sum(view * view_pred, axis=-1)))
+  # loss_view += jnp.mean(jnp.sum(view - view_repred, axis=-1))
+  # loss_view += jnp.mean((1.0 - jnp.sum(view * view_repred, axis=-1)))
+  return config.viewdir_loss_mult * loss_view
 
 
-def predicted_viewmlp_loss(ray_history, config):
+def tmlp_loss(ray_history, config):
   first_ray_results = ray_history[0]
   view_pred = first_ray_results['view_pred']
   view_pred_wo_normal = first_ray_results['view_pred_wo_normal']
-  loss_viewmlp = jnp.mean((1.0 - jnp.sum(view_pred * view_pred_wo_normal, axis=-1)).sum(axis=-1))    
+  loss_viewmlp = jnp.mean((1.0 - jnp.sum(view_pred * view_pred_wo_normal, axis=-1)))    
          
-  return config.predicted_viewmlp_loss_mult * loss_viewmlp
+  return config.tmlp_loss_mult * loss_viewmlp
   
 
 def clip_gradients(grad, config):
@@ -255,6 +258,7 @@ def create_train_step(model: models.Model,
       batch,
       cameras,
       train_frac,
+      is_second,
   ):
     """One optimization step.
 
@@ -288,7 +292,8 @@ def create_train_step(model: models.Model,
           rays,
           train_frac=train_frac,
           compute_extras=compute_extras,
-          zero_glo=False)
+          zero_glo=False,
+          is_second=is_second)
 
       losses = {}
 
@@ -311,11 +316,11 @@ def create_train_step(model: models.Model,
         losses['predicted_normals'] = predicted_normal_loss(
             model, ray_history, config)
 
-      if config.predicted_viewdir_loss_mult > 0:
-        losses['predicted_viewdirs'] = predicted_viewdir_loss(ray_history, config)
+      if config.viewdir_loss_mult > 0:
+        losses['viewdirs'] = viewdir_loss(ray_history, config)
       
-      if config.predicted_viewmlp_loss_mult > 0:
-        losses['predicted_viewmlp'] = predicted_viewmlp_loss(ray_history, config)
+      if config.tmlp_loss_mult > 0:
+        losses['tmlp'] = tmlp_loss(ray_history, config)
 
       stats['weight_l2s'] = summarize_tree(variables['params'], tree_norm_sq)
 
@@ -357,7 +362,7 @@ def create_train_step(model: models.Model,
   train_pstep = jax.pmap(
       train_step,
       axis_name='batch',
-      in_axes=(0, 0, 0, None, None),
+      in_axes=(0, 0, 0, None, None, None),
       donate_argnums=(0, 1))
   return train_pstep
 
@@ -385,7 +390,7 @@ def create_optimizer(
         **lr_kwargs)
 
   lr_fn_main = get_lr_fn(config.lr_init, config.lr_final)
-  tx = optax.adam(learning_rate=lr_fn_main, **adam_kwargs)
+  tx = optax.radam(learning_rate=lr_fn_main, **adam_kwargs)
 
   return TrainState.create(apply_fn=None, params=variables, tx=tx), lr_fn_main
 
@@ -400,7 +405,8 @@ def create_render_fn(model: models.Model):
             None,  # Deterministic.
             rays,
             train_frac=train_frac,
-            compute_extras=True),
+            compute_extras=True,
+            is_second=True), # For is_second is True
         axis_name='batch')
 
   # pmap over only the data input.
