@@ -258,7 +258,7 @@ def create_train_step(model: models.Model,
       batch,
       cameras,
       train_frac,
-      is_second,
+      isnt_warm,
   ):
     """One optimization step.
 
@@ -293,7 +293,7 @@ def create_train_step(model: models.Model,
           train_frac=train_frac,
           compute_extras=compute_extras,
           zero_glo=False,
-          is_second=is_second)
+          isnt_warm=isnt_warm)
 
       losses = {}
 
@@ -406,7 +406,7 @@ def create_render_fn(model: models.Model):
             rays,
             train_frac=train_frac,
             compute_extras=True,
-            is_second=True), # For is_second is True
+            isnt_warm=True), # For isnt_warm is True
         axis_name='batch')
 
   # pmap over only the data input.
@@ -436,5 +436,185 @@ def setup_model(
   state, lr_fn = create_optimizer(config, variables)
   render_eval_pfn = create_render_fn(model)
   train_pstep = create_train_step(model, config, dataset=dataset)
+
+  return model, state, render_eval_pfn, train_pstep, lr_fn
+
+
+
+
+def create_warmup_step(model: models.WarmupModel,
+                      config: configs.Config,
+                      dataset: Optional[datasets.Dataset] = None):
+  """Creates the pmap'ed Nerf training function.
+
+  Args:
+    model: The linen model.
+    config: The configuration.
+    dataset: Training dataset.
+
+  Returns:
+    pmap'ed training function.
+  """
+  if dataset is None:
+    camtype = camera_utils.ProjectionType.PERSPECTIVE
+  else:
+    camtype = dataset.camtype
+
+  def train_step(
+      rng,
+      state,
+      batch,
+      cameras,
+      train_frac,
+      isnt_warm,
+  ):
+    """One optimization step.
+
+    Args:
+      rng: jnp.ndarray, random number generator.
+      state: TrainState, state of the model/optimizer.
+      batch: dict, a mini-batch of data for training.
+      cameras: module containing camera poses.
+      train_frac: float, the fraction of training that is complete.
+
+    Returns:
+      A tuple (new_state, stats, rng) with
+        new_state: TrainState, new training state.
+        stats: list. [(loss, psnr), (loss_coarse, psnr_coarse)].
+        rng: jnp.ndarray, updated random number generator.
+    """
+    rng, key = random.split(rng)
+
+    def loss_fn(variables):
+      rays = batch.rays
+      if config.cast_rays_in_train_step:
+        rays = camera_utils.cast_ray_batch(cameras, rays, camtype, xnp=jnp)
+
+      # Indicates whether we need to compute output normal or depth maps in 2D.
+      compute_extras = (
+          config.compute_disp_metrics or config.compute_normal_metrics)
+
+      renderings, ray_history = model.apply(
+          variables,
+          key if config.randomized else None,
+          rays,
+          train_frac=train_frac,
+          compute_extras=compute_extras,
+          zero_glo=False,
+          isnt_warm=isnt_warm)
+
+      losses = {}
+
+      data_loss, stats = compute_data_loss(batch, renderings, rays, config)
+      losses['data'] = data_loss
+
+      if config.interlevel_loss_mult > 0:
+        losses['interlevel'] = interlevel_loss(ray_history, config)
+
+      if config.distortion_loss_mult > 0:
+        losses['distortion'] = distortion_loss(ray_history, config)
+
+      if (config.orientation_coarse_loss_mult > 0 or
+          config.orientation_loss_mult > 0):
+        losses['orientation'] = orientation_loss(rays, model, ray_history,
+                                                 config)
+
+      if (config.predicted_normal_coarse_loss_mult > 0 or
+          config.predicted_normal_loss_mult > 0):
+        losses['predicted_normals'] = predicted_normal_loss(
+            model, ray_history, config)
+
+      if config.viewdir_loss_mult > 0:
+        losses['viewdirs'] = viewdir_loss(ray_history, config)
+      
+      if config.tmlp_loss_mult > 0:
+        losses['tmlp'] = tmlp_loss(ray_history, config)
+
+      stats['weight_l2s'] = summarize_tree(variables['params'], tree_norm_sq)
+
+      if config.weight_decay_mults:
+        it = config.weight_decay_mults.items
+        losses['weight'] = jnp.sum(
+            jnp.array([m * stats['weight_l2s'][k] for k, m in it()]))
+
+      stats['loss'] = jnp.sum(jnp.array(list(losses.values())))
+      stats['losses'] = losses
+
+      return stats['loss'], stats
+
+    loss_grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (_, stats), grad = loss_grad_fn(state.params)
+
+    pmean = lambda x: jax.lax.pmean(x, axis_name='batch')
+    grad = pmean(grad)
+    stats = pmean(stats)
+
+    stats['grad_norms'] = summarize_tree(grad['params'], tree_norm)
+    stats['grad_maxes'] = summarize_tree(grad['params'], tree_abs_max)
+
+    grad = clip_gradients(grad, config)
+
+    grad = jax.tree_util.tree_map(jnp.nan_to_num, grad)
+
+    new_state = state.apply_gradients(grads=grad)
+
+    opt_delta = jax.tree_util.tree_map(lambda x, y: x - y, new_state,
+                                       state).params['params']
+    stats['opt_update_norms'] = summarize_tree(opt_delta, tree_norm)
+    stats['opt_update_maxes'] = summarize_tree(opt_delta, tree_abs_max)
+
+    stats['psnrs'] = image.mse_to_psnr(stats['mses'])
+    stats['psnr'] = stats['psnrs'][-1]
+    return new_state, stats, rng
+
+  train_pstep = jax.pmap(
+      train_step,
+      axis_name='batch',
+      in_axes=(0, 0, 0, None, None, None),
+      donate_argnums=(0, 1))
+  return train_pstep
+
+
+def create_warmup_render_fn(model: models.WarmupModel):
+  """Creates pmap'ed function for full image rendering."""
+
+  def render_eval_fn(variables, train_frac, _, rays):
+    return jax.lax.all_gather(
+        model.apply(
+            variables,
+            None,  # Deterministic.
+            rays,
+            train_frac=train_frac,
+            compute_extras=True,
+            isnt_warm=True), # For isnt_warm is True
+        axis_name='batch')
+
+  # pmap over only the data input.
+  render_eval_pfn = jax.pmap(
+      render_eval_fn,
+      in_axes=(None, None, None, 0),
+      axis_name='batch',
+  )
+  return render_eval_pfn
+
+
+def setup_warmup_model(
+    config: configs.Config,
+    rng: jnp.array,
+    dataset: Optional[datasets.Dataset] = None,
+) -> Tuple[models.WarmupModel, TrainState, Callable[
+    [FrozenVariableDict, jnp.array, utils.Rays],
+    MutableMapping[Text, Any]], Callable[
+        [jnp.array, TrainState, utils.Batch, Optional[Tuple[Any, ...]], float],
+        Tuple[TrainState, Dict[Text, Any], jnp.array]], Callable[[int], float]]:
+  """Creates NeRF model, optimizer, and pmap-ed train/render functions."""
+
+  dummy_rays = utils.dummy_rays(
+      include_exposure_idx=config.rawnerf_mode, include_exposure_values=True)
+  model, variables = models.construct_warmup_model(rng, dummy_rays, config)
+
+  state, lr_fn = create_optimizer(config, variables)
+  render_eval_pfn = create_warmup_render_fn(model)
+  train_pstep = create_warmup_step(model, config, dataset=dataset)
 
   return model, state, render_eval_pfn, train_pstep, lr_fn

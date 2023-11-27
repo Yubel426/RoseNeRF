@@ -118,8 +118,8 @@ class Model(nn.Module):
       rays,
       train_frac,
       compute_extras,
+      isnt_warm,
       zero_glo=True,
-      is_second=False,
       
   ):
     """The mip-NeRF Model.
@@ -139,10 +139,10 @@ class Model(nn.Module):
     # being regularized.
     nerf_mlp = NerfMLP()
     prop_mlp = nerf_mlp if self.single_mlp else PropMLP()
-    decoder = None if self.num_space == 1 else DecoderMLP()
     if self.use_viewmlp:
       view_mlp = ViewMLP()
       mini_view_mlp = ViewminiMLP()
+      decoder = DecoderMLP()
     if self.use_two_mlp:
       nerf_mlp2 = NerfMLP()
       prop_mlp2 = nerf_mlp2 if self.single_mlp else PropMLP()
@@ -202,7 +202,7 @@ class Model(nn.Module):
       is_prop = i_level < (self.num_levels - 1)
       num_samples = self.num_prop_samples if is_prop else self.num_nerf_samples
 
-      is_second = True if (i_level != 0 and self.use_viewmlp and is_second) else False
+      is_second = True if (i_level != 0 and self.use_viewmlp) else False
 
       # Dilate by some multiple of the expected span of each current interval,
       # with some bias added in.
@@ -309,8 +309,8 @@ class Model(nn.Module):
               dilation,
               domain=(init_s_near, init_s_far),
               renormalize=True)
-          sdist2 = sdist[..., 1:-1]
-          weights2 = weights[..., 1:-1]
+          sdist2 = sdist2[..., 1:-1]
+          weights2 = weights2[..., 1:-1]
 
         # A slightly more stable way to compute weights**anneal. If the distance
         # between adjacent intervals is zero then its weight is fixed to 0.
@@ -356,15 +356,22 @@ class Model(nn.Module):
           num_space=1 if is_prop else self.num_space,
         )
         weights2 = cumprod_weights(
-          ray_results['density'],
+          ray_results2['density'],
           tdist2,
           rays2.directions,
           opaque_background=self.opaque_background,
         )[0]
-        weights_to_use = jnp.concatenate(
-          [weights / 2, weights2 / 2], axis=-1)
-        rgb_to_use = jnp.concatenate(
-          [ray_results['rgb'] / 2, ray_results2['rgb'] / 2], axis=-2)
+        rgb_to_use, density_to_use = decoder(
+          key,
+          ray_results['features']+ray_results2['features'],
+          rays.viewdirs,
+        )
+        weights_to_use = cumprod_weights(
+            density_to_use,
+            tdist,
+            rays.directions,
+            opaque_background=self.opaque_background,
+        )[0]
       else:
         weights_to_use = weights
         rgb_to_use = ray_results['rgb']
@@ -466,10 +473,424 @@ class Model(nn.Module):
       ray_results['sdist'] = jnp.copy(sdist)
       ray_results['weights'] = jnp.copy(weights)
       ray_history.append(ray_results)
+      # if is_second:
+      #   ray_results2['sdist'] = jnp.copy(sdist)
+      #   ray_results2['weights'] = jnp.copy(weights2)
+      #   ray_history.append(ray_results2)
+
+    if compute_extras:
+      # Because the proposal network doesn't produce meaningful colors, for
+      # easier visualization we replace their colors with the final average
+      # color.
+      weights = [r['ray_weights'] for r in renderings]
+      rgbs = [r['ray_rgbs'] for r in renderings]
+      final_rgb = jnp.sum(rgbs[-1] * weights[-1][..., None], axis=-2)
+      avg_rgbs = [
+          jnp.broadcast_to(final_rgb[:, None, :], r.shape) for r in rgbs[:-1]
+      ]
+      for i in range(len(avg_rgbs)):
+        renderings[i]['ray_rgbs'] = avg_rgbs[i]
+        
+    return renderings, ray_history
+
+
+
+@gin.configurable
+class WarmupModel(nn.Module):
+  """A mip-Nerf360 model containing all MLPs."""
+  config: Any = None  # A Config class, must be set upon construction.
+  num_prop_samples: int = 64  # The number of samples for each proposal level.
+  num_nerf_samples: int = 32  # The number of samples the final nerf level.
+  num_levels: int = 3  # The number of sampling levels (3==2 proposals, 1 nerf).
+  bg_intensity_range: Tuple[float] = (1., 1.)  # The range of background colors.
+  anneal_slope: float = 10  # Higher = more rapid annealing.
+  stop_level_grad: bool = True  # If True, don't backprop across levels.
+  use_viewdirs: bool = True  # If True, use view directions as input.
+  raydist_fn: Callable[..., Any] = None  # The curve used for ray dists.
+  ray_shape: str = 'cone'  # The shape of cast rays ('cone' or 'cylinder').
+  disable_integration: bool = False  # If True, use PE instead of IPE.
+  single_jitter: bool = True  # If True, jitter whole rays instead of samples.
+  dilation_multiplier: float = 0.5  # How much to dilate intervals relatively.
+  dilation_bias: float = 0.0025  # How much to dilate intervals absolutely.
+  num_glo_features: int = 0  # GLO vector length, disabled if 0.
+  num_glo_embeddings: int = 1000  # Upper bound on max number of train images.
+  learned_exposure_scaling: bool = False  # Learned exposure scaling (RawNeRF).
+  near_anneal_rate: Optional[float] = None  # How fast to anneal in near bound.
+  near_anneal_init: float = 0.95  # Where to initialize near bound (in [0, 1]).
+  single_mlp: bool = False  # Use the NerfMLP for all rounds of sampling.
+  resample_padding: float = 0.0  # Dirichlet/alpha "padding" on the histogram.
+  use_gpu_resampling: bool = False  # Use gather ops for faster GPU resampling.
+  opaque_background: bool = False  # If true, make the background opaque.
+  num_space: int = 1 # The number of sub-spaces
+  use_viewmlp: bool = True # If true, use viewmlp
+  use_two_mlp: bool = False # If true, use two mlp for each level
+
+  @nn.compact
+  def __call__(
+      self,
+      rng,
+      rays,
+      train_frac,
+      compute_extras,
+      isnt_warm,
+      zero_glo=True,
+      
+  ):
+    """The mip-NeRF Model.
+
+    Args:
+      rng: random number generator (or None for deterministic output).
+      rays: util.Rays, a pytree of ray origins, directions, and viewdirs.
+      train_frac: float in [0, 1], what fraction of training is complete.
+      compute_extras: bool, if True, compute extra quantities besides color.
+      zero_glo: bool, if True, when using GLO pass in vector of zeros.
+
+    Returns:
+      ret: list, [*(rgb, distance, acc)]
+    """
+
+    # Construct MLPs. WARNING: Construction order may matter, if MLP weights are
+    # being regularized.
+    nerf_mlp = NerfMLP()
+    prop_mlp = nerf_mlp if self.single_mlp else PropMLP()
+    if self.use_viewmlp:
+      view_mlp = ViewMLP()
+      mini_view_mlp = ViewminiMLP()
+      decoder = DecoderMLP()
+    if self.use_two_mlp:
+      nerf_mlp2 = NerfMLP()
+      prop_mlp2 = nerf_mlp2 if self.single_mlp else PropMLP()
+    else:
+      nerf_mlp2 = nerf_mlp
+      prop_mlp2 = prop_mlp
+
+    if self.num_glo_features > 0:
+      if not zero_glo:
+        # Construct/grab GLO vectors for the cameras of each input ray.
+        glo_vecs = nn.Embed(self.num_glo_embeddings, self.num_glo_features)
+        cam_idx = rays.cam_idx[..., 0]
+        glo_vec = glo_vecs(cam_idx)
+      else:
+        glo_vec = jnp.zeros(rays.origins.shape[:-1] + (self.num_glo_features,))
+    else:
+      glo_vec = None
+
+    if self.learned_exposure_scaling:
+      # Setup learned scaling factors for output colors.
+      max_num_exposures = self.num_glo_embeddings
+      # Initialize the learned scaling offsets at 0.
+      init_fn = jax.nn.initializers.zeros
+      exposure_scaling_offsets = nn.Embed(
+          max_num_exposures,
+          features=3,
+          embedding_init=init_fn,
+          name='exposure_scaling_offsets')
+
+    # Define the mapping from normalized to metric ray distance.
+    _, s_to_t = coord.construct_ray_warps(self.raydist_fn, rays.near, rays.far)
+
+    # Initialize the range of (normalized) distances for each ray to [0, 1],
+    # and assign that single interval a weight of 1. These distances and weights
+    # will be repeatedly updated as we proceed through sampling levels.
+    # `near_anneal_rate` can be used to anneal in the near bound at the start
+    # of training, eg. 0.1 anneals in the bound over the first 10% of training.
+    if self.near_anneal_rate is None:
+      init_s_near = 0.
+    else:
+      init_s_near = jnp.clip(1 - train_frac / self.near_anneal_rate, 0,
+                             self.near_anneal_init)
+    init_s_far = 1.
+    sdist = jnp.concatenate([
+        jnp.full_like(rays.near, init_s_near),
+        jnp.full_like(rays.far, init_s_far)
+    ],
+                            axis=-1)
+    weights = jnp.ones_like(rays.near)
+    prod_num_samples = 1
+    sdist2 = jnp.copy(sdist)
+    weights2 = jnp.copy(weights)
+    ray_history = []
+    renderings = []
+
+    for i_level in range(self.num_levels):
+      is_prop = i_level < (self.num_levels - 1)
+      num_samples = self.num_prop_samples if is_prop else self.num_nerf_samples
+
+      is_second = False
+
+      # Dilate by some multiple of the expected span of each current interval,
+      # with some bias added in.
+      dilation = self.dilation_bias + self.dilation_multiplier * (
+          init_s_far - init_s_near) / prod_num_samples
+
+      # Record the product of the number of samples seen so far.
+      prod_num_samples *= num_samples
+
+      # After the first level (where dilation would be a no-op) optionally
+      # dilate the interval weights along each ray slightly so that they're
+      # overestimates, which can reduce aliasing.
+      use_dilation = self.dilation_bias > 0 or self.dilation_multiplier > 0
+      if i_level > 0 and use_dilation:
+        sdist, weights = stepfun.max_dilate_weights(
+            sdist,
+            weights,
+            dilation,
+            domain=(init_s_near, init_s_far),
+            renormalize=True)
+        sdist = sdist[..., 1:-1]
+        weights = weights[..., 1:-1]
+
+      # Optionally anneal the weights as a function of training iteration.
+      if self.anneal_slope > 0:
+        # Schlick's bias function, see https://arxiv.org/abs/2010.09714
+        bias = lambda x, s: (s * x) / ((s - 1) * x + 1)
+        anneal = bias(train_frac, self.anneal_slope)
+      else:
+        anneal = 1.
+
+      # A slightly more stable way to compute weights**anneal. If the distance
+      # between adjacent intervals is zero then its weight is fixed to 0.
+      logits_resample = jnp.where(
+          sdist[..., 1:] > sdist[..., :-1],
+          anneal * jnp.log(weights + self.resample_padding), -jnp.inf)
+
+      # Draw sampled intervals from each ray's current weights.
+      key, rng = random_split(rng)
+      sdist = stepfun.sample_intervals(
+          key,
+          sdist,
+          logits_resample,
+          num_samples,
+          single_jitter=self.single_jitter,
+          domain=(init_s_near, init_s_far),
+          use_gpu_resampling=self.use_gpu_resampling)
+
+      # Optimization will usually go nonlinear if you propagate gradients
+      # through sampling.
+      if self.stop_level_grad:
+        sdist = jax.lax.stop_gradient(sdist)
+
+      # Convert normalized distances to metric distances.
+      tdist = s_to_t(sdist)
+
+      # Cast our rays, by turning our distance intervals into Gaussians.
+      gaussians = render.cast_rays(
+          tdist,
+          rays.origins,
+          rays.directions,
+          rays.radii,
+          self.ray_shape,
+          diag=False)
+
+      if self.disable_integration:
+        # Setting the covariance of our Gaussian samples to 0 disables the
+        # "integrated" part of integrated positional encoding.
+        gaussians = (gaussians[0], jnp.zeros_like(gaussians[1]))
+      # print (f'level {i_level}')
+      # Push our Gaussians through one of our two MLPs.
+      mlp = prop_mlp if is_prop else nerf_mlp
+      key, rng = random_split(rng)
+      
+      ray_results = mlp(
+          key,
+          gaussians,
+          viewdirs=rays.viewdirs if self.use_viewdirs else None,
+          imageplane=rays.imageplane,
+          glo_vec=None if is_prop else glo_vec,
+          exposure=rays.exposure_values,
+          num_space=1 if is_prop else self.num_space,
+      )
+
+      # Get the weights used by volumetric rendering (and our other losses).
+      if is_prop or self.num_space == 1:
+        cumprod_weights = render.compute_alpha_weights  
+      else:
+        cumprod_weights = render.compute_alpha_weights_multispace
+      weights = cumprod_weights(
+          ray_results['density'],
+          tdist,
+          rays.directions,
+          opaque_background=self.opaque_background,
+      )[0]
+
+      
+      # Push our Gaussians through the second MLP if needed.
       if is_second:
-        ray_results2['sdist'] = jnp.copy(sdist)
-        ray_results2['weights'] = jnp.copy(weights2)
-        ray_history.append(ray_results2)
+        if i_level > 0 and use_dilation:
+          sdist2, weights2 = stepfun.max_dilate_weights(
+              sdist2,
+              weights2,
+              dilation,
+              domain=(init_s_near, init_s_far),
+              renormalize=True)
+          sdist2 = sdist2[..., 1:-1]
+          weights2 = weights2[..., 1:-1]
+
+        # A slightly more stable way to compute weights**anneal. If the distance
+        # between adjacent intervals is zero then its weight is fixed to 0.
+        logits_resample2 = jnp.where(
+            sdist2[..., 1:] > sdist2[..., :-1],
+            anneal * jnp.log(weights2 + self.resample_padding), -jnp.inf)
+
+        # Draw sampled intervals from each ray's current weights.
+        key, rng = random_split(rng)
+        sdist2 = stepfun.sample_intervals(
+            key,
+            sdist2,
+            logits_resample2,
+            num_samples,
+            single_jitter=self.single_jitter,
+            domain=(init_s_near, init_s_far),
+            use_gpu_resampling=self.use_gpu_resampling)
+
+        # Optimization will usually go nonlinear if you propagate gradients
+        # through sampling.
+        if self.stop_level_grad:
+          sdist2 = jax.lax.stop_gradient(sdist2)
+
+        # Convert normalized distances to metric distances.
+        tdist2 = s_to_t(sdist2)
+        # Cast our rays, by turning our distance intervals into Gaussians.
+        gaussians2 = render.cast_rays(
+          tdist2,
+          rays2.origins,
+          rays2.directions,
+          rays2.radii,
+          self.ray_shape,
+          diag=False)
+      
+        mlp2 = prop_mlp2 if is_prop else nerf_mlp2 
+        ray_results2 = mlp2(
+          key,
+          gaussians2,
+          viewdirs=rays2.viewdirs if self.use_viewdirs else None,
+          imageplane=rays2.imageplane,
+          glo_vec=None if is_prop else glo_vec,
+          exposure=rays2.exposure_values,
+          num_space=1 if is_prop else self.num_space,
+        )
+        weights2 = cumprod_weights(
+          ray_results2['density'],
+          tdist2,
+          rays2.directions,
+          opaque_background=self.opaque_background,
+        )[0]
+        rgb_to_use, density_to_use = decoder(
+          key,
+          ray_results['features']+ray_results2['features'],
+          rays.viewdirs,
+        )
+        weights_to_use = cumprod_weights(
+            density_to_use,
+            tdist,
+            rays.directions,
+            opaque_background=self.opaque_background,
+        )[0]
+      else:
+        weights_to_use = weights
+        rgb_to_use = ray_results['rgb']
+
+      # Define or sample the background color for each ray.
+      if self.bg_intensity_range[0] == self.bg_intensity_range[1]:
+        # If the min and max of the range are equal, just take it.
+        # bg_rgbs scalar
+        bg_rgbs = self.bg_intensity_range[0]
+      elif rng is None:
+        # If rendering is deterministic, use the midpoint of the range.
+        bg_rgbs = (self.bg_intensity_range[0] + self.bg_intensity_range[1]) / 2
+      else:
+        # Sample RGB values from the range for each ray.
+        # bg_rgbs [n_rays, n_samples, 3]
+        key, rng = random_split(rng)
+        bg_rgbs = random.uniform(
+            key,
+            shape=weights.shape[:-1] + (3,),
+            minval=self.bg_intensity_range[0],
+            maxval=self.bg_intensity_range[1])
+      
+      # RawNeRF exposure logic.
+      if rays.exposure_idx is not None:
+        # Scale output colors by the exposure.
+        ray_results['rgb'] *= rays.exposure_values[..., None, :]
+        if self.learned_exposure_scaling:
+          exposure_idx = rays.exposure_idx[..., 0]
+          # Force scaling offset to always be zero when exposure_idx is 0.
+          # This constraint fixes a reference point for the scene's brightness.
+          mask = exposure_idx > 0
+          # Scaling is parameterized as an offset from 1.
+          scaling = 1 + mask[..., None] * exposure_scaling_offsets(exposure_idx)
+          ray_results['rgb'] *= scaling[..., None, :]
+
+      if self.num_space == 1 or is_prop:
+        rendering = render.volumetric_rendering(
+            rgb_to_use,
+            weights_to_use,
+            tdist,
+            bg_rgbs,
+            rays.far,
+            compute_extras,
+            extras={
+                k: v
+                for k, v in ray_results.items()
+                if k.startswith('normals') or k in ['roughness']
+            })
+      else:
+        rendering, weights, ray_rgbs = render.volumetric_rendering_multispace(
+            ray_results['rgb'], 
+            weights, 
+            tdist, 
+            bg_rgbs, 
+            rays.far, 
+            compute_extras,
+            num_space=self.num_space*2 if is_second else self.num_space,
+            decoder=decoder,
+            extras={
+                k: v
+                for k, v in ray_results.items()
+                if k.startswith('normals') or k in ['roughness']
+            })
+        ray_results['rgb'] = ray_rgbs
+
+      if i_level == 0:
+        uvst = snerf_utils.get_rays_uvst(rays.origins, rays.viewdirs,0,1)
+        normal = (ray_results["normals"] * weights[..., None]).sum(axis=-2)
+        uvst_normal = jnp.concatenate([uvst, normal], axis=-1)
+        uvst_pred = view_mlp(uvst_normal)
+        new_origins = snerf_utils.get_interest_point(uvst_pred, rays.origins[...,-1:])
+        new_directions = snerf_utils.get_rays_d(uvst_pred, 0, 1)
+        new_viewdirs = new_directions / jnp.linalg.norm(new_directions, axis=-1, keepdims=True)
+        # rays2 = struct.replace(
+        #   rays, origins=new_origins, directions=new_directions, viewdirs=new_viewdirs)
+        rays2 = utils.Rays(**{**rays.__dict__, 'origins': new_origins, 'directions': new_directions, 'viewdirs': new_viewdirs})
+        uvst_repred = mini_view_mlp(uvst_pred)
+        uvst_pred_wo_normal = mini_view_mlp(uvst)
+        new_directions_wo_normal = snerf_utils.get_rays_d(uvst_pred_wo_normal, 0, 1)
+        ray_results['view'] = rays.viewdirs
+        ray_results['view_pred'] = new_viewdirs
+        ray_results['view_pred_wo_normal'] = new_directions_wo_normal
+        ray_results['view_repred'] = snerf_utils.get_rays_d(uvst_repred, 0, 1)
+        # ray_results['uvst_repred'] = uvst_repred
+        # ray_results['uvst'] = uvst
+
+      if compute_extras:
+        # Collect some rays to visualize directly. By naming these quantities
+        # with `ray_` they get treated differently downstream --- they're
+        # treated as bags of rays, rather than image chunks.
+        n = self.config.vis_num_rays
+        rendering['ray_sdist'] = sdist.reshape([-1, sdist.shape[-1]])[:n, :]
+        rendering['ray_weights'] = (
+            weights.reshape([-1, weights.shape[-1]])[:n, :])
+        rgb = ray_results['rgb']
+        rendering['ray_rgbs'] = (rgb.reshape((-1,) + rgb.shape[-2:]))[:n, :, :]
+
+      renderings.append(rendering)
+      ray_results['sdist'] = jnp.copy(sdist)
+      ray_results['weights'] = jnp.copy(weights)
+      ray_history.append(ray_results)
+      # if is_second:
+      #   ray_results2['sdist'] = jnp.copy(sdist)
+      #   ray_results2['weights'] = jnp.copy(weights2)
+      #   ray_history.append(ray_results2)
 
     if compute_extras:
       # Because the proposal network doesn't produce meaningful colors, for
@@ -509,6 +930,34 @@ def construct_model(rng, rays, config):
       rays=ray,
       train_frac=1.,
       compute_extras=False,
+      isnt_warm=True,
+      zero_glo=model.num_glo_features == 0)
+  return model, init_variables
+
+
+def construct_warmup_model(rng, rays, config):
+  """Construct a mip-NeRF 360 model.
+
+  Args:
+    rng: jnp.ndarray. Random number generator.
+    rays: an example of input Rays.
+    config: A Config class.
+
+  Returns:
+    model: initialized nn.Module, a NeRF model with parameters.
+    init_variables: flax.Module.state, initialized NeRF model parameters.
+  """
+  # Grab just 10 rays, to minimize memory overhead during construction.
+  ray = jax.tree_util.tree_map(lambda x: jnp.reshape(x, [-1, x.shape[-1]])[:10],
+                               rays)
+  model = WarmupModel(config=config)
+  init_variables = model.init(
+      rng,  # The RNG used by flax to initialize random weights.
+      rng=None,  # The RNG used by sampling within the model.
+      rays=ray,
+      train_frac=1.,
+      compute_extras=False,
+      isnt_warm=True,
       zero_glo=model.num_glo_features == 0)
   return model, init_variables
 
@@ -673,7 +1122,7 @@ class MLP(nn.Module):
       # it's the same as post-activation density, but is more numerically stable
       # when the activation function has a steep or flat gradient.
       normals = -ref_utils.l2_normalize(raw_grad_density)
-
+    features = x
     if self.enable_pred_normals:
       grad_pred = dense_layer(3)(x)
 
@@ -793,39 +1242,78 @@ class MLP(nn.Module):
         normals=normals,
         normals_pred=normals_pred,
         roughness=roughness,
+        features=features,
     )
     
 
 class Decoder(nn.Module):
-  net_depth: int = 2 # The depth of decoder module.
-  hidden_width: int = 64 # The hidden dim of the bottleneck layer.
-  net_output: int = 3 # The output dim of the Decoder.
+  net_depth: int = 4 # The depth of decoder module.
+  hidden_width: int = 256 # The hidden dim of the bottleneck layer.
+  num_rgb_channels: int = 3 # The output dim of the Decoder.
   weight_init: str = 'he_uniform'  # Initializer for the weights of the Decoder.
   net_activation: Callable[..., Any] = nn.relu  # The activation function.
-  
+  bottleneck_width: int = 128  # The width of the bottleneck vector.
+  bottleneck_noise: float = 0.0  # Std. deviation of noise added to bottleneck.
+  rgb_padding: float = 0.001  # Padding added to the RGB outputs.
+  deg_view: int = 4  # Degree of encoding for viewdirs or refdirs.
+  net_depth_viewdirs: int = 1  # The depth of the second part of ML.
+  net_width_viewdirs: int = 128  # The width of the second part of MLP.
+  rgb_activation: Callable[..., Any] = nn.sigmoid  # The RGB activation.
+  density_activation: Callable[..., Any] = nn.softplus  # Density activation.
+  density_bias: float = -1.  # Shift added to raw densities pre-activation.
+
+  def setup(self):
+
+
+    def dir_enc_fn(direction,_):
+      return coord.pos_enc(
+          direction, min_deg=0, max_deg=self.deg_view, append_identity=True)
+
+    self.dir_enc_fn = dir_enc_fn
+
   @nn.compact
   def __call__(self,
-               feats,
+               rng,
+               features,
+               viewdirs=None,
                ):
     dense_layer = functools.partial(
         nn.Dense, kernel_init=getattr(jax.nn.initializers, self.weight_init)())
-    
-    alpha = feats
+    x = features
     for _ in range(self.net_depth - 1):
-      feats = dense_layer(self.hidden_width)(feats)
-      feats = self.net_activation(feats)
+      x = dense_layer(self.hidden_width)(x)
+      x = self.net_activation(x)
+    raw_density = dense_layer(1)(x)[..., 0]
+    density = self.density_activation(raw_density + self.density_bias)
+    if viewdirs is not None:
+      bottleneck = dense_layer(self.bottleneck_width)(x)
+
+      # Add bottleneck noise.
+      if (rng is not None) and (self.bottleneck_noise > 0):
+        key, rng = random_split(rng)
+        bottleneck += self.bottleneck_noise * random.normal(
+            key, bottleneck.shape)
+
+        x = [bottleneck]
+
+      dir_enc = self.dir_enc_fn(viewdirs,None)
+
+      dir_enc = jnp.broadcast_to(
+          dir_enc[..., None, :],
+          bottleneck.shape[:-1] + (dir_enc.shape[-1],))
       
-      alpha = dense_layer(self.hidden_width)(alpha)
-      alpha = self.net_activation(alpha)
-    
-    alpha = dense_layer(1)(alpha)
-    alpha = nn.softmax(alpha, axis=-2)
-    
-    rgbs = dense_layer(3)(feats)
-    rgbs = nn.sigmoid(rgbs)
-    rgb = (alpha * rgbs).sum(-2)
-      
-    return rgb, rgbs, alpha
+      x = jnp.concatenate([x,dir_enc], axis=-1)
+      for i in range(self.net_depth_viewdirs):
+          x = dense_layer(self.net_width_viewdirs)(x)
+          x = self.net_activation(x)
+
+      # If using diffuse/specular colors, then `rgb` is treated as linear
+      # specular color. Otherwise it's treated as the color itself.
+      rgb = self.rgb_activation(dense_layer(self.num_rgb_channels)(x))
+      # Apply padding, mapping color to [-rgb_padding, 1+rgb_padding].
+      rgb = rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
+ 
+    return rgb, density
 
 
 @gin.configurable

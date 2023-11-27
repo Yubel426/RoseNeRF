@@ -68,6 +68,9 @@ def main(unused_argv):
     postprocess_fn = lambda z, _=None: z
 
   rng, key = random.split(rng)
+  setup_warmup = train_utils.setup_warmup_model(config, key, dataset=dataset)
+  warmup_model, state, warmup_render_eval_pfn, warmup_train_pstep, _ = setup_warmup
+
   setup = train_utils.setup_model(config, key, dataset=dataset)
   model, state, render_eval_pfn, train_pstep, lr_fn = setup
 
@@ -89,7 +92,6 @@ def main(unused_argv):
   # Resume training at the step of the last checkpoint.
   init_step = state.step + 1
   state = flax.jax_utils.replicate(state)
-
   if jax.host_id() == 0:
     summary_writer = tensorboard.SummaryWriter(config.checkpoint_dir)
     if config.rawnerf_mode:
@@ -110,6 +112,7 @@ def main(unused_argv):
     num_steps = config.early_exit_steps
   else:
     num_steps = config.max_steps
+  # warm up
   for step, batch in zip(range(init_step, num_steps + 1), pdataset):
 
     if reset_stats and (jax.host_id() == 0):
@@ -119,17 +122,126 @@ def main(unused_argv):
 
     learning_rate = lr_fn(step)
     train_frac = jnp.clip((step - 1) / (config.max_steps - 1), 0, 1)
-    is_second = False
-    if step > config.warmup_steps:
-      is_second = True
+    state, stats, rngs = warmup_train_pstep(
+        rngs,
+        state,
+        batch,
+        cameras,
+        train_frac,
+        True,
+    )
+
+
+    if step % config.gc_every == 0:
+      gc.collect()  # Disable automatic garbage collection for efficiency.
+
+    # Log training summaries. This is put behind a host_id check because in
+    # multi-host evaluation, all hosts need to run inference even though we
+    # only use host 0 to record results.
+    if jax.host_id() == 0:
+      stats = flax.jax_utils.unreplicate(stats)
+
+      stats_buffer.append(stats)
+
+      if step == init_step or step % config.print_every == 0:
+        elapsed_time = time.time() - train_start_time
+        steps_per_sec = config.print_every / elapsed_time
+        rays_per_sec = config.batch_size * steps_per_sec
+
+        # A robust approximation of total training time, in case of pre-emption.
+        total_time += int(round(TIME_PRECISION * elapsed_time))
+        total_steps += config.print_every
+        approx_total_time = int(round(step * total_time / total_steps))
+
+        # Transpose and stack stats_buffer along axis 0.
+        fs = [flax.traverse_util.flatten_dict(s, sep='/') for s in stats_buffer]
+        stats_stacked = {k: jnp.stack([f[k] for f in fs]) for k in fs[0].keys()}
+
+        # Split every statistic that isn't a vector into a set of statistics.
+        stats_split = {}
+        for k, v in stats_stacked.items():
+          if v.ndim not in [1, 2] and v.shape[0] != len(stats_buffer):
+            raise ValueError('statistics must be of size [n], or [n, k].')
+          if v.ndim == 1:
+            stats_split[k] = v
+          elif v.ndim == 2:
+            for i, vi in enumerate(tuple(v.T)):
+              stats_split[f'{k}/{i}'] = vi
+
+        # Summarize the entire histogram of each statistic.
+        for k, v in stats_split.items():
+          summary_writer.histogram('train_' + k, v, step)
+
+        # Take the mean and max of each statistic since the last summary.
+        avg_stats = {k: jnp.mean(v) for k, v in stats_split.items()}
+        max_stats = {k: jnp.max(v) for k, v in stats_split.items()}
+
+        summ_fn = lambda s, v: summary_writer.scalar(s, v, step)  # pylint:disable=cell-var-from-loop
+
+        # Summarize the mean and max of each statistic.
+        for k, v in avg_stats.items():
+          summ_fn(f'train_avg_{k}', v)
+        for k, v in max_stats.items():
+          summ_fn(f'train_max_{k}', v)
+
+        summ_fn('train_num_params', num_params)
+        summ_fn('train_learning_rate', learning_rate)
+        summ_fn('train_steps_per_sec', steps_per_sec)
+        summ_fn('train_rays_per_sec', rays_per_sec)
+
+        summary_writer.scalar('train_avg_psnr_timed', avg_stats['psnr'],
+                              total_time // TIME_PRECISION)
+        summary_writer.scalar('train_avg_psnr_timed_approx', avg_stats['psnr'],
+                              approx_total_time // TIME_PRECISION)
+
+        precision = int(np.ceil(np.log10(config.max_steps))) + 1
+        avg_loss = avg_stats['loss']
+        avg_psnr = avg_stats['psnr']
+        str_losses = {  # Grab each "losses_{x}" field and print it as "x[:4]".
+            k[7:11]: (f'{v:0.5f}' if v >= 1e-4 and v < 10 else f'{v:0.1e}')
+            for k, v in avg_stats.items()
+            if k.startswith('losses/')
+        }
+        print(f'{step:{precision}d}' + f'/{config.max_steps:d}: ' +
+              f'loss={avg_loss:0.5f}, ' + f'psnr={avg_psnr:6.3f}, ' +
+              f'lr={learning_rate:0.2e} | ' +
+              ', '.join([f'{k}={s}' for k, s in str_losses.items()]) +
+              f', {rays_per_sec:0.0f} r/s')
+
+        # Reset everything we are tracking between summarizations.
+        reset_stats = True
+
+      if step == config.warmup_steps:
+        state_to_save = jax.device_get(
+            flax.jax_utils.unreplicate(state))
+        checkpoints.save_checkpoint(
+            config.checkpoint_dir, state_to_save, int(step), keep=100)
+
+  # train
+  setup = train_utils.setup_model(config, key, dataset=dataset)
+  model, state, render_eval_pfn, train_pstep, lr_fn = setup
+  state = checkpoints.restore_checkpoint(config.checkpoint_dir, state)
+  # Resume training at the step of the last checkpoint.
+  init_step = config.warmup_steps + 1
+  state = flax.jax_utils.replicate(state)
+  for step, batch in zip(range(init_step, num_steps + 1), pdataset):
+
+    if reset_stats and (jax.host_id() == 0):
+      stats_buffer = []
+      train_start_time = time.time()
+      reset_stats = False
+
+    learning_rate = lr_fn(step)
+    train_frac = jnp.clip((step - 1) / (config.max_steps - 1), 0, 1)
     state, stats, rngs = train_pstep(
         rngs,
         state,
         batch,
         cameras,
         train_frac,
-        is_second,
+        True,
     )
+
 
     if step % config.gc_every == 0:
       gc.collect()  # Disable automatic garbage collection for efficiency.
