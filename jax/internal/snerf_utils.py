@@ -39,4 +39,4 @@ def get_rays_d(uvst, z1=0, z2=1):
     c = jnp.full_like(a, z2 - z1)  # Assuming z1=0 and z2=1
     # 方向归一化
     rays_d = l2_normalize(jnp.concatenate([a, b, c], axis=-1))
-    return rays_d
+    return -1. * rays_d

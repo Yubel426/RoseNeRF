@@ -431,7 +431,7 @@ class Model(nn.Module):
         ray_results['rgb'] = ray_rgbs
 
       if i_level == 0:
-        uvst = snerf_utils.get_rays_uvst(rays.origins, rays.directions,0,1)
+        uvst = snerf_utils.get_rays_uvst(rays.origins, rays.viewdirs,0,1)
         normal = (ray_results["normals"] * weights[..., None]).sum(axis=-2)
         uvst_normal = jnp.concatenate([uvst, normal], axis=-1)
         uvst_pred = view_mlp(uvst_normal)
@@ -444,8 +444,8 @@ class Model(nn.Module):
         uvst_repred = mini_view_mlp(uvst_pred)
         uvst_pred_wo_normal = mini_view_mlp(uvst)
         new_directions_wo_normal = snerf_utils.get_rays_d(uvst_pred_wo_normal, 0, 1)
-        ray_results['view'] = rays.origins
-        ray_results['view_pred'] = new_directions
+        ray_results['view'] = rays.viewdirs
+        ray_results['view_pred'] = new_viewdirs
         ray_results['view_pred_wo_normal'] = new_directions_wo_normal
         ray_results['view_repred'] = snerf_utils.get_rays_d(uvst_repred, 0, 1)
         # ray_results['uvst_repred'] = uvst_repred
