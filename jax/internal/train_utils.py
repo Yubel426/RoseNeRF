@@ -200,7 +200,7 @@ def viewdir_loss(ray_history, config):
   # uvst = ray_results['uvst']
   loss_view = jnp.mean((1.0 - jnp.sum(view * view_pred, axis=-1)))
   # loss_view += jnp.mean(jnp.sum(view - view_repred, axis=-1))
-  # loss_view += jnp.mean((1.0 - jnp.sum(view * view_repred, axis=-1)))
+  loss_view += jnp.mean((1.0 - jnp.sum(view * view_repred, axis=-1)))
   return config.viewdir_loss_mult * loss_view
 
 
@@ -390,7 +390,7 @@ def create_optimizer(
         **lr_kwargs)
 
   lr_fn_main = get_lr_fn(config.lr_init, config.lr_final)
-  tx = optax.radam(learning_rate=lr_fn_main, **adam_kwargs)
+  tx = optax.adam(learning_rate=lr_fn_main, **adam_kwargs)
 
   return TrainState.create(apply_fn=None, params=variables, tx=tx), lr_fn_main
 
