@@ -69,10 +69,10 @@ def main(unused_argv):
 
   rng, key = random.split(rng)
   setup_warmup = train_utils.setup_warmup_model(config, key, dataset=dataset)
-  warmup_model, state, warmup_render_eval_pfn, warmup_train_pstep, _ = setup_warmup
+  model, state, warmup_render_eval_pfn, warmup_train_pstep, lr_fn = setup_warmup
 
-  setup = train_utils.setup_model(config, key, dataset=dataset)
-  model, state, render_eval_pfn, train_pstep, lr_fn = setup
+  # setup = train_utils.setup_model(config, key, dataset=dataset)
+  # model, state, render_eval_pfn, train_pstep, lr_fn = setup
 
   variables = state.params
   num_params = jax.tree_util.tree_reduce(
@@ -99,7 +99,7 @@ def main(unused_argv):
         # Log shutter speed metadata in TensorBoard for debug purposes.
         for key in ['exposure_idx', 'exposure_values', 'unique_shutters']:
           summary_writer.text(f'{name}_{key}', str(data.metadata[key]), 0)
-
+ 
   # Prefetch_buffer_size = 3 x batch_size.
   pdataset = flax.jax_utils.prefetch_to_device(dataset, 3)
   rng = rng + jax.host_id()  # Make random seed separate across hosts.
@@ -113,7 +113,8 @@ def main(unused_argv):
   else:
     num_steps = config.max_steps
   # warm up
-  for step, batch in zip(range(init_step, num_steps + 1), pdataset):
+  print('@@@@@@@@@@@@@@@@warmup start!@@@@@@@@@@@@@@@@@@@')
+  for step, batch in zip(range(init_step, config.warmup_steps + 1), pdataset):
 
     if reset_stats and (jax.host_id() == 0):
       stats_buffer = []
@@ -211,12 +212,12 @@ def main(unused_argv):
         # Reset everything we are tracking between summarizations.
         reset_stats = True
 
-      if step == config.warmup_steps:
-        state_to_save = jax.device_get(
-            flax.jax_utils.unreplicate(state))
-        checkpoints.save_checkpoint(
-            config.checkpoint_dir, state_to_save, int(step), keep=100)
-
+    if step == config.warmup_steps or (jax.host_id() == 0 and config.max_steps % config.checkpoint_every != 0):
+      state_to_save = jax.device_get(
+          flax.jax_utils.unreplicate(state))
+      checkpoints.save_checkpoint(
+          config.checkpoint_dir, state_to_save, int(step), keep=100)
+  print('@@@@@@@@@@@@@@@@warmup done!@@@@@@@@@@@@@@@@@@@')
   # train
   setup = train_utils.setup_model(config, key, dataset=dataset)
   model, state, render_eval_pfn, train_pstep, lr_fn = setup
@@ -224,6 +225,7 @@ def main(unused_argv):
   # Resume training at the step of the last checkpoint.
   init_step = config.warmup_steps + 1
   state = flax.jax_utils.replicate(state)
+  print('@@@@@@@@@@@@@@@@train start!@@@@@@@@@@@@@@@@@@@')
   for step, batch in zip(range(init_step, num_steps + 1), pdataset):
 
     if reset_stats and (jax.host_id() == 0):
