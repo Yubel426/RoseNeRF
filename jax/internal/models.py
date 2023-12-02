@@ -142,7 +142,8 @@ class Model(nn.Module):
     if self.use_viewmlp:
       view_mlp = ViewMLP()
       mini_view_mlp = ViewminiMLP()
-      decoder = DecoderMLP()
+      nerfdecoder = NerfDecoder()
+      propdecoder = PropDecoder()
     if self.use_two_mlp:
       nerf_mlp2 = NerfMLP()
       prop_mlp2 = nerf_mlp2 if self.single_mlp else PropMLP()
@@ -346,6 +347,8 @@ class Model(nn.Module):
           diag=False)
       
         mlp2 = prop_mlp2 if is_prop else nerf_mlp2 
+        decoder = propdecoder if is_prop else nerfdecoder
+
         ray_results2 = mlp2(
           key,
           gaussians2,
@@ -556,7 +559,8 @@ class WarmupModel(nn.Module):
     if self.use_viewmlp:
       view_mlp = ViewMLP()
       mini_view_mlp = ViewminiMLP()
-      decoder = DecoderMLP()
+      nerfdecoder = NerfDecoder()
+      propdecoder = PropDecoder()
     if self.use_two_mlp:
       nerf_mlp2 = NerfMLP()
       prop_mlp2 = nerf_mlp2 if self.single_mlp else PropMLP()
@@ -760,6 +764,7 @@ class WarmupModel(nn.Module):
           diag=False)
       
         mlp2 = prop_mlp2 if is_prop else nerf_mlp2 
+        decoder = propdecoder if is_prop else nerfdecoder
         ray_results2 = mlp2(
           key,
           gaussians2,
@@ -1261,6 +1266,7 @@ class Decoder(nn.Module):
   rgb_activation: Callable[..., Any] = nn.sigmoid  # The RGB activation.
   density_activation: Callable[..., Any] = nn.softplus  # Density activation.
   density_bias: float = -1.  # Shift added to raw densities pre-activation.
+  disable_rgb: bool = False  # If True don't output RGB.
 
   def setup(self):
 
@@ -1285,34 +1291,37 @@ class Decoder(nn.Module):
       x = self.net_activation(x)
     raw_density = dense_layer(1)(x)[..., 0]
     density = self.density_activation(raw_density + self.density_bias)
-    if viewdirs is not None:
-      bottleneck = dense_layer(self.bottleneck_width)(x)
+    if self.disable_rgb:
+      rgb = jnp.zeros(features.shape[:-1] + (self.num_rgb_channels,))
+    else:
+      if viewdirs is not None:
+        bottleneck = dense_layer(self.bottleneck_width)(x)
 
-      # Add bottleneck noise.
-      if (rng is not None) and (self.bottleneck_noise > 0):
-        key, rng = random_split(rng)
-        bottleneck += self.bottleneck_noise * random.normal(
-            key, bottleneck.shape)
+        # Add bottleneck noise.
+        if (rng is not None) and (self.bottleneck_noise > 0):
+          key, rng = random_split(rng)
+          bottleneck += self.bottleneck_noise * random.normal(
+              key, bottleneck.shape)
 
-        x = [bottleneck]
+          x = [bottleneck]
 
-      dir_enc = self.dir_enc_fn(viewdirs,None)
+        dir_enc = self.dir_enc_fn(viewdirs,None)
 
-      dir_enc = jnp.broadcast_to(
-          dir_enc[..., None, :],
-          bottleneck.shape[:-1] + (dir_enc.shape[-1],))
-      
-      x = jnp.concatenate([x,dir_enc], axis=-1)
-      for i in range(self.net_depth_viewdirs):
-          x = dense_layer(self.net_width_viewdirs)(x)
-          x = self.net_activation(x)
+        dir_enc = jnp.broadcast_to(
+            dir_enc[..., None, :],
+            bottleneck.shape[:-1] + (dir_enc.shape[-1],))
+        
+        x = jnp.concatenate([x,dir_enc], axis=-1)
+        for i in range(self.net_depth_viewdirs):
+            x = dense_layer(self.net_width_viewdirs)(x)
+            x = self.net_activation(x)
 
-      # If using diffuse/specular colors, then `rgb` is treated as linear
-      # specular color. Otherwise it's treated as the color itself.
-      rgb = self.rgb_activation(dense_layer(self.num_rgb_channels)(x))
-      # Apply padding, mapping color to [-rgb_padding, 1+rgb_padding].
-      rgb = rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
- 
+        # If using diffuse/specular colors, then `rgb` is treated as linear
+        # specular color. Otherwise it's treated as the color itself.
+        rgb = self.rgb_activation(dense_layer(self.num_rgb_channels)(x))
+        # Apply padding, mapping color to [-rgb_padding, 1+rgb_padding].
+        rgb = rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
+  
     return rgb, density
 
 
@@ -1326,7 +1335,11 @@ class PropMLP(MLP):
   pass
 
 @gin.configurable
-class DecoderMLP(Decoder):
+class NerfDecoder(Decoder):
+  pass
+
+@gin.configurable
+class PropDecoder(Decoder):
   pass
 
 def render_image(render_fn: Callable[[jnp.array, utils.Rays],
