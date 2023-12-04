@@ -143,7 +143,6 @@ class Model(nn.Module):
       view_mlp = ViewMLP()
       mini_view_mlp = ViewminiMLP()
       nerfdecoder = NerfDecoder()
-      propdecoder = PropDecoder()
     if self.use_two_mlp:
       nerf_mlp2 = NerfMLP()
       prop_mlp2 = nerf_mlp2 if self.single_mlp else PropMLP()
@@ -347,7 +346,7 @@ class Model(nn.Module):
           diag=False)
       
         mlp2 = prop_mlp2 if is_prop else nerf_mlp2 
-        decoder = propdecoder if is_prop else nerfdecoder
+        decoder = nerfdecoder
 
         ray_results2 = mlp2(
           key,
@@ -364,9 +363,14 @@ class Model(nn.Module):
           rays2.directions,
           opaque_background=self.opaque_background,
         )[0]
+        if ray_results['confidence'] is not None:
+          conf = (ray_results['confidence'] * weights).sum(axis=-1,keepdims=True)
+          conf = jnp.clip(conf, 1e-5, 1.0 - 1e-5)
+        else:
+          conf = 1.
         rgb_to_use, density_to_use = decoder(
           key,
-          ray_results['features']+ray_results2['features'],
+          ray_results['features']+ray_results2['features']*conf,
           rays.viewdirs,
         )
         weights_to_use = cumprod_weights(
@@ -560,7 +564,6 @@ class WarmupModel(nn.Module):
       view_mlp = ViewMLP()
       mini_view_mlp = ViewminiMLP()
       nerfdecoder = NerfDecoder()
-      propdecoder = PropDecoder()
     if self.use_two_mlp:
       nerf_mlp2 = NerfMLP()
       prop_mlp2 = nerf_mlp2 if self.single_mlp else PropMLP()
@@ -764,7 +767,7 @@ class WarmupModel(nn.Module):
           diag=False)
       
         mlp2 = prop_mlp2 if is_prop else nerf_mlp2 
-        decoder = propdecoder if is_prop else nerfdecoder
+        decoder =  nerfdecoder
         ray_results2 = mlp2(
           key,
           gaussians2,
@@ -1006,6 +1009,7 @@ class MLP(nn.Module):
   warp_fn: Callable[..., Any] = None
   basis_shape: str = 'icosahedron'  # `octahedron` or `icosahedron`.
   basis_subdivisions: int = 2  # Tesselation count. 'octahedron' + 1 == eye(3).
+  use_confidence: bool = False  # If True, use confidence as a feature.
 
   def setup(self):
     # Make sure that normals are computed if reflection direction is used.
@@ -1128,6 +1132,11 @@ class MLP(nn.Module):
       # when the activation function has a steep or flat gradient.
       normals = -ref_utils.l2_normalize(raw_grad_density)
     features = x
+    if self.use_confidence:
+      # [batch, n_samples]
+      confidence = nn.sigmoid(dense_layer(1)(x)[..., 0])
+    else:
+      confidence = None
     if self.enable_pred_normals:
       grad_pred = dense_layer(3)(x)
 
@@ -1248,6 +1257,7 @@ class MLP(nn.Module):
         normals_pred=normals_pred,
         roughness=roughness,
         features=features,
+        confidence=confidence,
     )
     
 
