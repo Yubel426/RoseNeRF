@@ -363,14 +363,14 @@ class Model(nn.Module):
           rays2.directions,
           opaque_background=self.opaque_background,
         )[0]
-        if ray_results['confidence'] is not None:
-          conf = (ray_results['confidence'] * weights).sum(axis=-1,keepdims=True)
-          conf = jnp.clip(conf, 1e-5, 1.0 - 1e-5)
-        else:
-          conf = 1.
+        # if ray_results['confidence'] is not None:
+        #   conf = (ray_results['confidence'] * weights).sum(axis=-1,keepdims=True)
+        #   conf = jnp.clip(conf, 1e-5, 1.0 - 1e-5)
+        # else:
+        #   conf = 1.
         rgb_to_use, density_to_use = decoder(
           key,
-          ray_results['features']+ray_results2['features']*conf,
+          ray_results['features']+ray_results2['features'],
           rays.viewdirs,
         )
         weights_to_use = cumprod_weights(
