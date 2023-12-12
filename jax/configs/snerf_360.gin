@@ -1,0 +1,56 @@
+Config.dataset_loader = 'llff'
+Config.near = 0.2
+Config.far = 1e6
+Config.factor = 0
+Config.max_steps = 200000
+Config.batch_size = 1024
+Config.render_chunk_size = 1024
+Config.checkpoint_every = 10000
+Config.train_render_every = 100000
+Config.lr_init = 2e-3
+
+Model.raydist_fn = @jnp.reciprocal
+Model.opaque_background = True
+WarmupModel.raydist_fn = @jnp.reciprocal
+WarmupModel.opaque_background = True
+
+# for refnerf
+Config.predicted_normal_loss_mult = 0
+Config.predicted_normal_coarse_loss_mult = 0
+
+# for snerf
+Model.use_viewmlp = True
+Model.use_two_mlp = False
+WarmupModel.use_viewmlp = True
+WarmupModel.use_two_mlp = False
+Config.warmup_steps = 1
+Config.viewdir_loss_mult = 0.
+Config.tmlp_loss_mult = 0.
+# Config.weightrgb_loss_mult= 1e-5
+# Config.confidence_mult= 1e-5
+
+
+# sample
+# Model.num_prop_samples = 32  
+# Model.num_nerf_samples = 16
+# WarmupModel.num_prop_samples = 32  
+# WarmupModel.num_nerf_samples = 16
+
+PropMLP.warp_fn = @coord.contract
+PropMLP.net_depth = 4
+PropMLP.net_width = 256
+PropMLP.disable_density_normals = False
+PropMLP.disable_rgb = True
+PropMLP.enable_pred_normals = True
+# PropMLP.use_confidence = True
+
+NerfMLP.warp_fn = @coord.contract
+NerfMLP.net_depth = 8
+NerfMLP.net_width = 256
+NerfDecoder.hidden_width = 256 # should be the same as NerfMLP.net_width
+NerfDecoder.disable_rgb = False
+NerfMLP.disable_density_normals = True
+NerfMLP.enable_pred_normals = True
+NerfMLP.disable_rgb = False
+# NerfMLP.use_confidence = True
+
