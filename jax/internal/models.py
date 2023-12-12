@@ -363,25 +363,6 @@ class Model(nn.Module):
           rays2.directions,
           opaque_background=self.opaque_background,
         )[0]
-        # if ray_results['confidence'] is not None:
-        #   conf = (ray_results['confidence'] * weights).sum(axis=-1,keepdims=True)
-        #   conf = jnp.clip(conf, 1e-5, 1.0 - 1e-5)
-        # else:
-        #   conf = 1.
-        rgb_to_use, density_to_use = decoder(
-          key,
-          ray_results['features']+ray_results2['features'],
-          rays.viewdirs,
-        )
-        weights_to_use = cumprod_weights(
-            density_to_use,
-            tdist,
-            rays.directions,
-            opaque_background=self.opaque_background,
-        )[0]
-      else:
-        weights_to_use = weights
-        rgb_to_use = ray_results['rgb']
 
       # Define or sample the background color for each ray.
       if self.bg_intensity_range[0] == self.bg_intensity_range[1]:
@@ -416,8 +397,8 @@ class Model(nn.Module):
 
       if self.num_space == 1 or is_prop:
         rendering = render.volumetric_rendering(
-            rgb_to_use,
-            weights_to_use,
+            ray_results['rgb'],
+            weights,
             tdist,
             bg_rgbs,
             rays.far,
@@ -443,7 +424,22 @@ class Model(nn.Module):
                 if k.startswith('normals') or k in ['roughness']
             })
         ray_results['rgb'] = ray_rgbs
-
+      if is_second:
+        rendering2 = render.volumetric_rendering(
+              ray_results2['rgb'],
+              weights2,
+              tdist2,
+              bg_rgbs,
+              rays2.far,
+              compute_extras,
+              extras={
+                  k: v
+                  for k, v in ray_results.items()
+                  if k.startswith('normals') or k in ['roughness']
+              })
+        rendering['rgb'] = rendering['rgb'] + rendering2['rgb']
+        # rendering['rgb'] = rendering['rgb'] / 2
+        rendering['rgb'] = jnp.clip(rendering['rgb'], 0, 1)
       if i_level == 0:
         uvst = snerf_utils.get_rays_uvst(rays.origins, rays.viewdirs,0,1)
         normal = (ray_results["normals"] * weights[..., None]).sum(axis=-2)
@@ -783,20 +779,7 @@ class WarmupModel(nn.Module):
           rays2.directions,
           opaque_background=self.opaque_background,
         )[0]
-        rgb_to_use, density_to_use = decoder(
-          key,
-          ray_results['features']+ray_results2['features'],
-          rays.viewdirs,
-        )
-        weights_to_use = cumprod_weights(
-            density_to_use,
-            tdist,
-            rays.directions,
-            opaque_background=self.opaque_background,
-        )[0]
-      else:
-        weights_to_use = weights
-        rgb_to_use = ray_results['rgb']
+
 
       # Define or sample the background color for each ray.
       if self.bg_intensity_range[0] == self.bg_intensity_range[1]:
@@ -831,8 +814,8 @@ class WarmupModel(nn.Module):
 
       if self.num_space == 1 or is_prop:
         rendering = render.volumetric_rendering(
-            rgb_to_use,
-            weights_to_use,
+            ray_results['rgb'],
+            weights,
             tdist,
             bg_rgbs,
             rays.far,
@@ -858,7 +841,22 @@ class WarmupModel(nn.Module):
                 if k.startswith('normals') or k in ['roughness']
             })
         ray_results['rgb'] = ray_rgbs
-
+      if is_second:
+        rendering2 = render.volumetric_rendering(
+              ray_results2['rgb'],
+              weights2,
+              tdist2,
+              bg_rgbs,
+              rays2.far,
+              compute_extras,
+              extras={
+                  k: v
+                  for k, v in ray_results.items()
+                  if k.startswith('normals') or k in ['roughness']
+              })
+        rendering['rgb'] = rendering['rgb'] + rendering2['rgb']
+        # rendering['rgb'] = rendering['rgb'] / 2
+        rendering['rgb'] = jnp.clip(rendering['rgb'], 0, 1)
       if i_level == 0:
         uvst = snerf_utils.get_rays_uvst(rays.origins, rays.viewdirs,0,1)
         normal = (ray_results["normals"] * weights[..., None]).sum(axis=-2)
