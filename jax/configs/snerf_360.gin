@@ -23,9 +23,9 @@ Model.use_viewmlp = True
 Model.use_two_mlp = False
 WarmupModel.use_viewmlp = True
 WarmupModel.use_two_mlp = False
-Config.warmup_steps = 1
+Config.warmup_steps = 5000
 Config.viewdir_loss_mult = 0.
-Config.tmlp_loss_mult = 0.
+Config.tmlp_loss_mult = 3e-4
 # Config.weightrgb_loss_mult= 1e-5
 # Config.confidence_mult= 1e-5
 
