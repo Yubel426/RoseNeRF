@@ -1,6 +1,6 @@
-export CUDA_VISIBLE_DEVICES=7
+export CUDA_VISIBLE_DEVICES=5
 
-SCENE=Ball
+SCENE=dolphin
 EXPERIMENT=logs_snerf
 DATA_DIR=/home/nxt/nxtdg/datasets
 CHECKPOINT_DIR=/home/nxt/nxtdg/logs/"$EXPERIMENT"/"$SCENE"
