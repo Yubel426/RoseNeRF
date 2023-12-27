@@ -438,7 +438,7 @@ class Model(nn.Module):
                   if k.startswith('normals') or k in ['roughness']
               })
         rendering['rgb'] = rendering['rgb'] + rendering2['rgb']
-        rendering['rgb'] = rendering['rgb'] / 2
+        # rendering['rgb'] = rendering['rgb'] / 2
         rendering['rgb'] = jnp.clip(rendering['rgb'], 0, 1)
       if i_level == 0:
         uvst = snerf_utils.get_rays_uvst(rays.origins, rays.viewdirs,0,1)
@@ -855,7 +855,7 @@ class WarmupModel(nn.Module):
                   if k.startswith('normals') or k in ['roughness']
               })
         rendering['rgb'] = rendering['rgb'] + rendering2['rgb']
-        rendering['rgb'] = rendering['rgb'] / 2
+        # rendering['rgb'] = rendering['rgb'] / 2
         rendering['rgb'] = jnp.clip(rendering['rgb'], 0, 1)
       if i_level == 0:
         uvst = snerf_utils.get_rays_uvst(rays.origins, rays.viewdirs,0,1)
