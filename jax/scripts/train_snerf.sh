@@ -12,3 +12,11 @@ python -m train \
   --gin_bindings="Config.data_dir = '${DATA_DIR}/${SCENE}'" \
   --gin_bindings="Config.checkpoint_dir = '${CHECKPOINT_DIR}'" \
   --logtostderr
+
+  python -m eval \
+  --gin_configs=configs/snerf_360.gin \
+  --gin_bindings="Config.dataset_loader = 'llff'" \
+  --gin_bindings="Config.factor = 0" \
+  --gin_bindings="Config.data_dir = '${DATA_DIR}/${SCENE}'" \
+  --gin_bindings="Config.checkpoint_dir = '${CHECKPOINT_DIR}'" \
+  --logtostderr
