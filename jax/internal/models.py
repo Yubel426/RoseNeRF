@@ -50,7 +50,7 @@ def random_split(rng):
 class ViewMLP(nn.Module):
     @nn.compact
     def __call__(self, x):
-        dim_out = [128, 128, 128, 4]
+        dim_out = [128, 128, 128, 6]
         padding = 0.001
 
         # Define the layers
@@ -68,7 +68,7 @@ class ViewMLP(nn.Module):
 class ViewminiMLP(nn.Module):
     @nn.compact
     def __call__(self, x):
-        dim_out = [64, 64, 4]
+        dim_out = [64, 64, 6]
 
         # Define the layers
         for i in range(3):
@@ -445,23 +445,25 @@ class Model(nn.Module):
         ray_results['rgb'] = ray_rgbs
 
       if i_level == 0:
-        uvst = snerf_utils.get_rays_uvst(rays.origins, rays.viewdirs,0,1)
+        # uvst = snerf_utils.get_rays_uvst(rays.origins, rays.viewdirs,0,1)
+        ray_ov = jnp.concatenate([rays.origins, rays.viewdirs], axis=-1)
         normal = (ray_results["normals"] * weights[..., None]).sum(axis=-2)
-        uvst_normal = jnp.concatenate([uvst, normal], axis=-1)
-        uvst_pred = view_mlp(uvst_normal)
-        new_origins = snerf_utils.get_interest_point(uvst_pred, rays.origins[...,-1:])
-        new_directions = snerf_utils.get_rays_d(uvst_pred, 0, 1)
+        ray_ovn = jnp.concatenate([rays.origins, rays.viewdirs,normal], axis=-1)
+        # uvst_normal = jnp.concatenate([uvst, normal], axis=-1)
+        ray_ov_pred = view_mlp(ray_ovn)
+        new_origins = ray_ov_pred[..., :3]
+        new_directions = ray_ov_pred[..., 3:6]
         new_viewdirs = new_directions / jnp.linalg.norm(new_directions, axis=-1, keepdims=True)
         # rays2 = struct.replace(
         #   rays, origins=new_origins, directions=new_directions, viewdirs=new_viewdirs)
         rays2 = utils.Rays(**{**rays.__dict__, 'origins': new_origins, 'directions': new_directions, 'viewdirs': new_viewdirs})
-        uvst_repred = mini_view_mlp(uvst_pred)
-        uvst_pred_wo_normal = mini_view_mlp(uvst)
-        new_directions_wo_normal = snerf_utils.get_rays_d(uvst_pred_wo_normal, 0, 1)
+        ray_ov_repred = mini_view_mlp(ray_ov_pred)
+        ray_ov_pred_wo_normal = mini_view_mlp(ray_ov)
+        new_directions_wo_normal = ray_ov_pred_wo_normal[..., 3:6] / jnp.linalg.norm(ray_ov_pred_wo_normal[..., 3:6], axis=-1, keepdims=True)
         ray_results['view'] = rays.viewdirs
         ray_results['view_pred'] = new_viewdirs
         ray_results['view_pred_wo_normal'] = new_directions_wo_normal
-        ray_results['view_repred'] = snerf_utils.get_rays_d(uvst_repred, 0, 1)
+        ray_results['view_repred'] = ray_ov_repred[..., 3:6] / jnp.linalg.norm(ray_ov_repred[..., 3:6], axis=-1, keepdims=True)
         # ray_results['uvst_repred'] = uvst_repred
         # ray_results['uvst'] = uvst
 
@@ -860,23 +862,25 @@ class WarmupModel(nn.Module):
         ray_results['rgb'] = ray_rgbs
 
       if i_level == 0:
-        uvst = snerf_utils.get_rays_uvst(rays.origins, rays.viewdirs,0,1)
+        # uvst = snerf_utils.get_rays_uvst(rays.origins, rays.viewdirs,0,1)
+        ray_ov = jnp.concatenate([rays.origins, rays.viewdirs], axis=-1)
         normal = (ray_results["normals"] * weights[..., None]).sum(axis=-2)
-        uvst_normal = jnp.concatenate([uvst, normal], axis=-1)
-        uvst_pred = view_mlp(uvst_normal)
-        new_origins = snerf_utils.get_interest_point(uvst_pred, rays.origins[...,-1:])
-        new_directions = snerf_utils.get_rays_d(uvst_pred, 0, 1)
+        ray_ovn = jnp.concatenate([rays.origins, rays.viewdirs,normal], axis=-1)
+        # uvst_normal = jnp.concatenate([uvst, normal], axis=-1)
+        ray_ov_pred = view_mlp(ray_ovn)
+        new_origins = ray_ov_pred[..., :3]
+        new_directions = ray_ov_pred[..., 3:6]
         new_viewdirs = new_directions / jnp.linalg.norm(new_directions, axis=-1, keepdims=True)
         # rays2 = struct.replace(
         #   rays, origins=new_origins, directions=new_directions, viewdirs=new_viewdirs)
         rays2 = utils.Rays(**{**rays.__dict__, 'origins': new_origins, 'directions': new_directions, 'viewdirs': new_viewdirs})
-        uvst_repred = mini_view_mlp(uvst_pred)
-        uvst_pred_wo_normal = mini_view_mlp(uvst)
-        new_directions_wo_normal = snerf_utils.get_rays_d(uvst_pred_wo_normal, 0, 1)
+        ray_ov_repred = mini_view_mlp(ray_ov_pred)
+        ray_ov_pred_wo_normal = mini_view_mlp(ray_ov)
+        new_directions_wo_normal = ray_ov_pred_wo_normal[..., 3:6] / jnp.linalg.norm(ray_ov_pred_wo_normal[..., 3:6], axis=-1, keepdims=True)
         ray_results['view'] = rays.viewdirs
         ray_results['view_pred'] = new_viewdirs
         ray_results['view_pred_wo_normal'] = new_directions_wo_normal
-        ray_results['view_repred'] = snerf_utils.get_rays_d(uvst_repred, 0, 1)
+        ray_results['view_repred'] = ray_ov_repred[..., 3:6] / jnp.linalg.norm(ray_ov_repred[..., 3:6], axis=-1, keepdims=True)
         # ray_results['uvst_repred'] = uvst_repred
         # ray_results['uvst'] = uvst
 
