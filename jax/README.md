@@ -1,29 +1,15 @@
-# This is the code release for MS-NeRF(CVPR 2023) based on [MultiNeRF](https://github.com/google-research/multinerf)
-
-
-This repository contains the code release for CVPR 2023 paper [MS-NeRF](https://arxiv.org/abs/2305.04268), and we conduct all the Mip-NeRF 360 based experiments in this repository, therefore, you should reproduce the results reported in our paper.
-
-Besides, the original repository contains three CVPR 2022 papers: 
-[Mip-NeRF 360](https://jonbarron.info/mipnerf360/),
-[Ref-NeRF](https://dorverbin.github.io/refnerf/), and
-[RawNeRF](https://bmild.github.io/rawnerf/).
-As we make minimal modifications, other methods should be runnable.
-But we recommend using the original repository.
-
-This implementation is written in [JAX](https://github.com/google/jax), and
-is a fork of [MultiNeRF](https://github.com/google-research/multinerf).
-This is research code, and should be treated accordingly.
+# This is the code release for RoseNeRF based on [MultiNeRF](https://github.com/google-research/multinerf)
 
 ## Setup
 
 ```
 # Clone the repo.
-git clone https://github.com/ZX-Yin/ms-nerf.git
-cd ms-nerf/jax/
+git clone https://github.com/Yubel426/RoseNeRF.git
+cd rosenerf/jax/
 
 # Make a conda environment.
-conda create --name ms-nerf python=3.9
-conda activate ms-nerf
+conda create --name rosenerf python=3.9
+conda activate rosenerf
 
 # Prepare pip.
 conda install pip
@@ -40,13 +26,9 @@ git clone https://github.com/rmbrualla/pycolmap.git ./internal/pycolmap
 ```
 You'll probably also need to update your JAX installation to support GPUs or TPUs.
 
-## Running MS-Mip-NeRF 360
+## Running 
 
-Example scripts for training, evaluating and rendering with MS-Mip-NeRF 360 can be found in `scripts/msnerf/`. And we evaluate the PSNR, SSIM, and LPIPS using our own script.
-
-## Running MS-Mip-NeRF and NeRF
-
-We are trying to integrate this two experiments into this repository.
+Example scripts for training, evaluating and rendering can be found in `scripts/`. And we evaluate the PSNR, SSIM, and LPIPS using our own script.
 
 ## Evaluating
 
